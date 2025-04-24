@@ -11,27 +11,22 @@ from .exceptions import MissingMandatoryConfig
 
 def _match(pattern: str, text: str, ignore_case: bool = False) -> bool:
     """
-    Try glob first, then regex, then exact match.
-      - Glob if pattern contains *, ?, [ or ]
-      - Regex if pattern contains any of . + ^ $ ( ) { } | \
-      - Exact otherwise
-    Honors ignore_case by lowercasing both pattern & text.
+    Match text against pattern with:
+      • Glob (case-insensitive)
+      • Regex (case-sensitive by default, -i to ignore case)
+      • Exact (case-insensitive)
     """
-    if ignore_case:
-        pattern = pattern.lower()
-        text = text.lower()
-
-    # 1) Glob
+    # 1) Glob if it contains *, ?, [ or ]
     if any(c in pattern for c in "*?[]"):
-        return fnmatch.fnmatch(text, pattern)
+        return fnmatch.fnmatch(text.lower(), pattern.lower())
 
-    # 2) Regex
+    # 2) Regex if it contains regex-special chars
     if any(c in pattern for c in ".+^$(){}|\\"):
         flags = re.IGNORECASE if ignore_case else 0
         return re.search(pattern, text, flags) is not None
 
-    # 3) Exact
-    return pattern == text
+    # 3) Exact match (case-insensitive)
+    return text.lower() == pattern.lower()
 
 def _flatten(d: dict, prefix: str = "") -> dict:
     """Flatten nested dict into { 'a.b.c': value, … }."""
