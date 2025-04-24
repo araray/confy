@@ -1,18 +1,36 @@
+# confy/cli.py
+
 import json
 import os
 import re
 import fnmatch
 import click
 
-from .loader    import Config, get_by_dot, set_by_dot
+from .loader import Config, get_by_dot, set_by_dot
 from .exceptions import MissingMandatoryConfig
 
-def _match(pattern: str, text: str) -> bool:
-    """Regex if special chars, else glob, else exact."""
-    if any(c in pattern for c in ".*+?^$[](){}|\\"):
-        return re.search(pattern, text) is not None
+def _match(pattern: str, text: str, ignore_case: bool = False) -> bool:
+    """
+    Try glob first, then regex, then exact match.
+      - Glob if pattern contains *, ?, [ or ]
+      - Regex if pattern contains any of . + ^ $ ( ) { } | \
+      - Exact otherwise
+    Honors ignore_case by lowercasing both pattern & text.
+    """
+    if ignore_case:
+        pattern = pattern.lower()
+        text = text.lower()
+
+    # 1) Glob
     if any(c in pattern for c in "*?[]"):
         return fnmatch.fnmatch(text, pattern)
+
+    # 2) Regex
+    if any(c in pattern for c in ".+^$(){}|\\"):
+        flags = re.IGNORECASE if ignore_case else 0
+        return re.search(pattern, text, flags) is not None
+
+    # 3) Exact
     return pattern == text
 
 def _flatten(d: dict, prefix: str = "") -> dict:
@@ -38,20 +56,20 @@ def cli(ctx, file_path, prefix, overrides, defaults, mandatory):
     confy CLI: inspect & mutate JSON/TOML configs via dot-notation.
 
     Load a file (`-c config.toml`), then run subcommands:
-      • get     KEY      → prints value as JSON
-      • set     KEY VAL  → updates file on disk
-      • exists  KEY      → exit 0 if present, 1 otherwise
-      • search  [--key PAT] [--val PAT]
-      • dump             → pretty-print entire config
-      • convert [--to json|toml] [--out FILE]
+      • get       KEY
+      • set       KEY VAL
+      • exists    KEY
+      • search    [--key PAT] [--val PAT] [-i]
+      • dump
+      • convert   [--to json|toml] [--out FILE]
     """
-    # 1) parse defaults file if given
+    # 1) load defaults.json if provided
     defaults_dict = {}
     if defaults:
         with open(defaults, "r") as f:
             defaults_dict = json.load(f)
 
-    # 2) parse overrides string to dict
+    # 2) parse overrides to dict
     overrides_dict = {}
     if overrides:
         for pair in overrides.split(","):
@@ -65,6 +83,7 @@ def cli(ctx, file_path, prefix, overrides, defaults, mandatory):
     # 3) mandatory list
     mandatory_list = mandatory.split(",") if mandatory else []
 
+    # 4) build Config
     try:
         cfg = Config(
             file_path=file_path,
@@ -86,9 +105,7 @@ def cli(ctx, file_path, prefix, overrides, defaults, mandatory):
 @click.argument("key")
 @click.pass_context
 def get(ctx, key):
-    """
-    Print the value of KEY (dot-notation) as JSON.
-    """
+    """Print the value of KEY (dot-notation) as JSON."""
     cfg = ctx.obj["cfg"]
     try:
         val = get_by_dot(cfg.as_dict(), key)
@@ -111,7 +128,6 @@ def set(ctx, key, value):
         click.secho("Error: --config must be provided for `set`", fg="red", err=True)
         ctx.exit(1)
 
-    # load raw file
     ext = os.path.splitext(fp)[1].lower()
     with open(fp, "r") as f:
         if ext == ".toml":
@@ -120,14 +136,12 @@ def set(ctx, key, value):
         else:
             data = json.load(f)
 
-    # parse & set
     try:
         parsed = json.loads(value)
     except:
         parsed = value
     set_by_dot(data, key, parsed)
 
-    # write back
     with open(fp, "w") as f:
         if ext == ".toml":
             import toml as _toml
@@ -141,12 +155,9 @@ def set(ctx, key, value):
 @click.argument("key")
 @click.pass_context
 def exists(ctx, key):
-    """
-    Exit 0 if KEY exists in config, 1 otherwise.
-    """
-    cfg = ctx.obj["cfg"]
+    """Exit 0 if KEY exists in config, 1 otherwise."""
     try:
-        get_by_dot(cfg.as_dict(), key)
+        get_by_dot(ctx.obj["cfg"].as_dict(), key)
         click.echo("true")
         ctx.exit(0)
     except KeyError:
@@ -154,10 +165,12 @@ def exists(ctx, key):
         ctx.exit(1)
 
 @cli.command()
-@click.option("--key", "key_pat",    help="Search keys (regex/glob/plain)")
-@click.option("--val", "val_pat",    help="Search values (regex/glob/plain)")
+@click.option("--key", "key_pat",    help="Pattern for keys (regex/glob/plain)")
+@click.option("--val", "val_pat",    help="Pattern for values (regex/glob/plain)")
+@click.option("-i", "--ignore-case", is_flag=True,
+              help="Make key/value matching case-insensitive")
 @click.pass_context
-def search(ctx, key_pat, val_pat):
+def search(ctx, key_pat, val_pat, ignore_case):
     """
     Search for keys/values matching patterns.
     At least one of --key or --val must be provided.
@@ -169,8 +182,8 @@ def search(ctx, key_pat, val_pat):
     flat = _flatten(ctx.obj["cfg"].as_dict())
     found = {}
     for k, v in flat.items():
-        ks = _match(key_pat, k) if key_pat else True
-        vs = _match(val_pat, str(v)) if val_pat else True
+        ks = _match(key_pat, k, ignore_case) if key_pat else True
+        vs = _match(val_pat, str(v), ignore_case) if val_pat else True
         if ks and vs:
             found[k] = v
 
@@ -183,9 +196,7 @@ def search(ctx, key_pat, val_pat):
 @cli.command()
 @click.pass_context
 def dump(ctx):
-    """
-    Pretty-print the entire config as JSON.
-    """
+    """Pretty-print the entire config as JSON."""
     click.echo(json.dumps(ctx.obj["cfg"].as_dict(), indent=2))
 
 @cli.command()
