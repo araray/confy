@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "confy"
+version = "0.1.0"
+description = "Minimal Python configuration library with dot-notation, JSON/TOML, env-var and dict overrides."
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "MIT" }
+authors = [{ name="Araray Velho", email="araray@gmail.com" }]
+dependencies = [
+    "toml>=0.10.2",
+    "click>=8.0"
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+
+[project.scripts]
+confy = "confy.cli:cli"
