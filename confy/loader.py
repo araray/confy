@@ -66,7 +66,7 @@ class Config:
     Main confy configuration class.
     Allows accessing configuration values using dot notation (e.g., `cfg.section.key`).
     """
-    # Reverting removal of _is_nested, keeping slots
+    # Keeping slots and _is_nested from previous attempt
     __slots__ = ('_data', '_is_nested')
 
     def __init__(self,
@@ -136,27 +136,29 @@ class Config:
 
     def __getattr__(self, name: str) -> Any:
         """Handles attribute access (e.g., cfg.section.key)."""
-        # --- Detailed Debug Logging ---
-        is_nested_val = getattr(self, '_is_nested', 'Unknown') # Handle case where slot might not be set yet?
+        is_nested_val = getattr(self, '_is_nested', 'Unknown')
         data_keys = list(self._data.keys()) if isinstance(self._data, dict) else 'Not a dict'
         log.debug(f"DEBUG [confy.__getattr__]: ENTER - Accessing '{name}' on Config(is_nested={is_nested_val})")
-        log.debug(f"DEBUG [confy.__getattr__]: self._data type: {type(self._data)}")
         log.debug(f"DEBUG [confy.__getattr__]: self._data keys: {data_keys}")
-        log.debug(f"DEBUG [confy.__getattr__]: name type: {type(name)}")
-        log.debug(f"DEBUG [confy.__getattr__]: Checking if '{name}' in self._data...")
 
-        # Perform the check and log the result
-        key_exists = False
-        if isinstance(self._data, dict):
-             key_exists = name in self._data
-        log.debug(f"DEBUG [confy.__getattr__]: Result of ('{name}' in self._data): {key_exists}")
-        # --- End Detailed Debug Logging ---
+        if name.startswith('_'):
+             log.error(f"DEBUG [confy.__getattr__]: Attempting access to internal attribute '{name}'. Raising AttributeError.")
+             raise AttributeError(f"Attempted to access internal attribute: {name}")
 
-        if name.startswith('_') or not key_exists:
-             log.error(f"DEBUG [confy.__getattr__]: Attribute '{name}' check failed (startswith_={name.startswith('_')}, key_exists={key_exists}). Raising AttributeError.")
-             raise AttributeError(f"No such config key: {name}")
+        try:
+            # *** Use try/except instead of 'in' check ***
+            value = self._data[name]
+            log.debug(f"DEBUG [confy.__getattr__]: Successfully accessed key '{name}' via self._data[name].")
+        except KeyError:
+            # This block should now correctly handle the case where the key is missing
+            log.error(f"DEBUG [confy.__getattr__]: KeyError accessing '{name}' in _data keys: {data_keys}. Raising AttributeError.")
+            raise AttributeError(f"No such config key: {name}") from None
+        except TypeError as e:
+             # Catch if self._data is not a dictionary somehow
+             log.error(f"DEBUG [confy.__getattr__]: TypeError accessing '{name}'. self._data is not a dict? Type: {type(self._data)}. Error: {e}", exc_info=True)
+             raise AttributeError(f"Configuration data is not accessible like a dictionary for key: {name}") from e
 
-        value = self._data[name]
+
         value_type = type(value).__name__
         log.debug(f"DEBUG [confy.__getattr__]: Found key '{name}'. Value type: {value_type}")
 
@@ -182,7 +184,6 @@ class Config:
         """String representation."""
         data_repr = str(self._data)
         if len(data_repr) > 100: data_repr = data_repr[:100] + '...'
-        # Use getattr for safety in case _is_nested isn't initialized (shouldn't happen with slots)
         return f"Config(is_nested={getattr(self, '_is_nested', 'N/A')}, data={data_repr})"
 
     def __contains__(self, key: str) -> bool:
