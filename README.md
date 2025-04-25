@@ -10,11 +10,9 @@
 - Inspect and **mutate** config files from the command line  
 
 Precedence of values:
-```
 
-defaults → config file → environment variables → overrides_dict
+`defaults → config file → environment variables → overrides_dict`
 
-```
 ---
 
 ## Table of Contents
@@ -59,7 +57,7 @@ pip install confy
 Or from source:
 
 ```bash
-git clone https://github.com/your-org/confy.git
+git clone https://github.com/araray/confy.git
 cd confy
 pip install .
 ```
