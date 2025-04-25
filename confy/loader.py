@@ -66,7 +66,7 @@ class Config:
     Main confy configuration class.
     Allows accessing configuration values using dot notation (e.g., `cfg.section.key`).
     """
-    # Use slots including _is_nested flag
+    # Reverting removal of _is_nested, keeping slots
     __slots__ = ('_data', '_is_nested')
 
     def __init__(self,
@@ -77,47 +77,36 @@ class Config:
                  mandatory: list[str] = None,
                  _nested_data: dict = None): # Internal arg for nested creation
 
-        # Flag to indicate if this instance is wrapping a nested dictionary
         self._is_nested = _nested_data is not None
 
         if self._is_nested:
-            # If created via __getattr__ for nesting, just store the provided data
-            # Ensure it's a dictionary
             self._data = _nested_data if isinstance(_nested_data, dict) else {}
             log.debug(f"DEBUG [confy.__init__]: Created nested Config with data keys: {list(self._data.keys())}")
         else:
-            # --- Standard Initialization Logic for top-level Config ---
             log.debug(f"DEBUG [confy.__init__]: Initializing top-level Config.")
             merged_data = {}
-            if defaults:
-                merged_data = defaults.copy() # Start with a copy of defaults
+            if defaults: merged_data = defaults.copy()
 
-            # Load from file
             if file_path:
-                if not os.path.exists(file_path):
-                    raise FileNotFoundError(f"Configuration file not found: {file_path}")
+                if not os.path.exists(file_path): raise FileNotFoundError(f"Config file not found: {file_path}")
                 ext = os.path.splitext(file_path)[1].lower()
                 try:
                     with open(file_path, 'rb' if ext == '.toml' else 'r') as f:
                         if ext == '.toml': loaded = tomllib.load(f)
                         elif ext == '.json': loaded = json.load(f)
                         else: raise ValueError(f"Unsupported config file type: {ext}")
-                    log.debug(f"DEBUG [confy.__init__]: Loaded from file {file_path}: {loaded}")
-                    deep_merge(merged_data, loaded) # Merge file content
-                except Exception as e:
-                    raise RuntimeError(f"Error loading configuration file {file_path}: {e}") from e
+                    log.debug(f"DEBUG [confy.__init__]: Loaded from file {file_path}")
+                    deep_merge(merged_data, loaded)
+                except Exception as e: raise RuntimeError(f"Error loading config file {file_path}: {e}") from e
 
-            self._data = merged_data # Store merged data
+            self._data = merged_data
             log.debug(f"DEBUG [confy.__init__]: Data after file merge keys: {list(self._data.keys())}")
 
-            # Apply overrides (Env Vars, Dict) - modifying self._data
             if prefix: self._apply_env(prefix)
             if overrides_dict:
-                for key, val in overrides_dict.items():
-                    set_by_dot(self._data, key, val)
+                for key, val in overrides_dict.items(): set_by_dot(self._data, key, val)
             log.debug(f"DEBUG [confy.__init__]: Data after overrides keys: {list(self._data.keys())}")
 
-            # Enforce mandatory keys on the final merged data
             if mandatory: self._validate_mandatory(mandatory)
             log.debug(f"DEBUG [confy.__init__]: Top-level Config initialization complete.")
 
@@ -136,22 +125,35 @@ class Config:
                 except Exception as e: log.warning(f"Warning: Could not JSON parse env var {var}: {e}. Using raw string."); val = raw
                 set_by_dot(self._data, dot_key, val)
                 applied_count += 1
-        log.debug(f"DEBUG [confy._apply_env]: Applied {applied_count} environment variables with prefix '{prefix}'.")
+        log.debug(f"DEBUG [confy._apply_env]: Applied {applied_count} env vars with prefix '{prefix}'.")
 
 
     def _validate_mandatory(self, keys: list[str]):
         """Checks for mandatory keys."""
-        missing = [k for k in keys if k not in self] # Use __contains__
-        if missing:
-            raise MissingMandatoryConfig(missing)
+        missing = [k for k in keys if k not in self]
+        if missing: raise MissingMandatoryConfig(missing)
         log.debug(f"DEBUG [confy._validate_mandatory]: All mandatory keys present: {keys}")
 
     def __getattr__(self, name: str) -> Any:
         """Handles attribute access (e.g., cfg.section.key)."""
-        log.debug(f"DEBUG [confy.__getattr__]: Accessing '{name}' on Config(is_nested={getattr(self, '_is_nested', False)}) with _data keys: {list(self._data.keys())}")
+        # --- Detailed Debug Logging ---
+        is_nested_val = getattr(self, '_is_nested', 'Unknown') # Handle case where slot might not be set yet?
+        data_keys = list(self._data.keys()) if isinstance(self._data, dict) else 'Not a dict'
+        log.debug(f"DEBUG [confy.__getattr__]: ENTER - Accessing '{name}' on Config(is_nested={is_nested_val})")
+        log.debug(f"DEBUG [confy.__getattr__]: self._data type: {type(self._data)}")
+        log.debug(f"DEBUG [confy.__getattr__]: self._data keys: {data_keys}")
+        log.debug(f"DEBUG [confy.__getattr__]: name type: {type(name)}")
+        log.debug(f"DEBUG [confy.__getattr__]: Checking if '{name}' in self._data...")
 
-        if name.startswith('_') or name not in self._data:
-             log.error(f"DEBUG [confy.__getattr__]: Attribute '{name}' not found in _data keys: {list(self._data.keys())}. Raising AttributeError.")
+        # Perform the check and log the result
+        key_exists = False
+        if isinstance(self._data, dict):
+             key_exists = name in self._data
+        log.debug(f"DEBUG [confy.__getattr__]: Result of ('{name}' in self._data): {key_exists}")
+        # --- End Detailed Debug Logging ---
+
+        if name.startswith('_') or not key_exists:
+             log.error(f"DEBUG [confy.__getattr__]: Attribute '{name}' check failed (startswith_={name.startswith('_')}, key_exists={key_exists}). Raising AttributeError.")
              raise AttributeError(f"No such config key: {name}")
 
         value = self._data[name]
@@ -160,7 +162,6 @@ class Config:
 
         if isinstance(value, dict):
             log.debug(f"DEBUG [confy.__getattr__]: Value for '{name}' is dict. Creating nested Config via constructor with _nested_data.")
-            # *** Use internal _nested_data argument for nested creation ***
             nested_config = Config(_nested_data=value)
             log.debug(f"DEBUG [confy.__getattr__]: Returning nested Config for '{name}' with _data keys: {list(nested_config._data.keys())}")
             return nested_config
@@ -181,6 +182,7 @@ class Config:
         """String representation."""
         data_repr = str(self._data)
         if len(data_repr) > 100: data_repr = data_repr[:100] + '...'
+        # Use getattr for safety in case _is_nested isn't initialized (shouldn't happen with slots)
         return f"Config(is_nested={getattr(self, '_is_nested', 'N/A')}, data={data_repr})"
 
     def __contains__(self, key: str) -> bool:
