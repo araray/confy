@@ -36,14 +36,28 @@ def set_by_dot(cfg: dict, key: str, value: Any):
         d = d[p]
     d[parts[-1]] = value
 
+# --- REVISED get_by_dot ---
 def get_by_dot(cfg: dict, key: str) -> Any:
-    """Retrieve a nested dict value by dot-notated key."""
+    """
+    Retrieve a nested dict value by dot-notated key using direct access.
+    Raises KeyError if any part is missing or path is invalid.
+    """
     d = cfg
-    for p in key.split('.'):
-        if not isinstance(d, dict) or p not in d:
-             raise KeyError(f"Key '{p}' not found in path '{key}'")
-        d = d[p]
-    return d
+    try:
+        for p in key.split('.'):
+            # Use direct dictionary access (__getitem__)
+            # This avoids calling __contains__ recursively.
+            d = d[p]
+        return d
+    except KeyError as e:
+        # Re-raise KeyError with a more informative message including the full path
+        # e.args[0] usually contains the missing key part
+        missing_part = e.args[0] if e.args else p # p is the last attempted part
+        raise KeyError(f"Key path '{key}' not found (missing part: '{missing_part}')") from None
+    except TypeError as e:
+        # Catch error if trying to access item on non-dict
+        raise TypeError(f"Invalid access path '{key}': encountered non-dictionary item.") from e
+# --- END REVISED get_by_dot ---
 
 class Config(dict): # Inherit from dict
     """
@@ -59,22 +73,13 @@ class Config(dict): # Inherit from dict
                  mandatory: list[str] = None,
                  **kwargs):
 
-        # Initialize the dictionary part first (handles args like initial data)
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs) # Initialize dict part
 
-        # --- Configuration Loading Logic ---
-        # 1. Start with a deep copy of defaults
         merged_data = copy.deepcopy(defaults) if defaults else {}
+        deep_merge(merged_data, self) # Merge initial data into defaults copy
 
-        # 2. Merge initial data provided via args/kwargs (if any)
-        #    The super().__init__ already handled this, but we merge defaults first.
-        #    So, merge self (which contains initial data) into the defaults copy.
-        deep_merge(merged_data, self)
-
-        # 3. Load from file and merge
         if file_path:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Configuration file not found: {file_path}")
+            if not os.path.exists(file_path): raise FileNotFoundError(f"Config file not found: {file_path}")
             ext = os.path.splitext(file_path)[1].lower()
             try:
                 with open(file_path, 'rb' if ext == '.toml' else 'r') as f:
@@ -82,30 +87,21 @@ class Config(dict): # Inherit from dict
                     elif ext == '.json': loaded = json.load(f)
                     else: raise ValueError(f"Unsupported config file type: {ext}")
                 log.debug(f"DEBUG [confy.__init__]: Loaded from file {file_path}")
-                deep_merge(merged_data, loaded) # Merge file content
-            except Exception as e:
-                raise RuntimeError(f"Error loading configuration file {file_path}: {e}") from e
+                deep_merge(merged_data, loaded)
+            except Exception as e: raise RuntimeError(f"Error loading config file {file_path}: {e}") from e
 
-        # 4. Update self with the fully merged data so far
-        #    We use update() which is a standard dict method.
-        self.update(merged_data)
+        self.update(merged_data) # Update self with merged data
         log.debug(f"DEBUG [confy.__init__]: Data after file/defaults merge.")
 
-        # 5. Apply environment variable overrides directly to self
         if prefix: self._apply_env(prefix)
-
-        # 6. Apply explicit overrides dictionary
         if overrides_dict:
-            for key, val in overrides_dict.items():
-                set_by_dot(self, key, val) # Use self here
+            for key, val in overrides_dict.items(): set_by_dot(self, key, val)
         log.debug(f"DEBUG [confy.__init__]: Applied overrides.")
 
-        # 7. Recursively wrap nested dictionaries *after* all merges/overrides
-        self._wrap_nested_dicts()
+        self._wrap_nested_dicts() # Convert nested dicts to Config
         log.debug(f"DEBUG [confy.__init__]: Wrapped nested dicts.")
 
-        # 8. Enforce mandatory keys on the final structure
-        if mandatory: self._validate_mandatory(mandatory)
+        if mandatory: self._validate_mandatory(mandatory) # Validate after everything is loaded/wrapped
         log.debug(f"DEBUG [confy.__init__]: Config initialization complete.")
 
     def _apply_env(self, prefix: str):
@@ -120,105 +116,93 @@ class Config(dict): # Inherit from dict
                 try: val = json.loads(raw)
                 except json.JSONDecodeError: val = raw
                 except Exception as e: log.warning(f"Warning: Could not JSON parse env var {var}: {e}. Using raw string."); val = raw
-                set_by_dot(self, dot_key, val) # Use self
+                set_by_dot(self, dot_key, val)
                 applied_count += 1
         log.debug(f"DEBUG [confy._apply_env]: Applied {applied_count} env vars with prefix '{prefix}'.")
 
+    # --- REVISED _validate_mandatory ---
     def _validate_mandatory(self, keys: list[str]):
-        """Checks for mandatory keys using dot notation."""
+        """Checks for mandatory keys using the fixed get_by_dot."""
         missing = []
         for k in keys:
-            try: get_by_dot(self, k) # Use self
-            except KeyError: missing.append(k)
-        if missing: raise MissingMandatoryConfig(missing)
+            try:
+                get_by_dot(self, k) # Use the fixed get_by_dot
+            except KeyError:
+                missing.append(k) # Key not found
+        if missing:
+            raise MissingMandatoryConfig(missing)
         log.debug(f"DEBUG [confy._validate_mandatory]: All mandatory keys present: {keys}")
+    # --- END REVISED _validate_mandatory ---
 
     def _wrap_nested_dicts(self):
         """Recursively converts nested dicts to Config objects."""
-        # Iterate over a copy of items to allow modification during iteration
         for key, value in list(self.items()):
             if isinstance(value, dict) and not isinstance(value, Config):
-                # Convert plain dict to Config object, passing the dict as initial data
-                self[key] = Config(value)
-                # No need to call _wrap_nested_dicts here, it's handled by the new object's __init__
+                self[key] = Config(value) # Pass dict to constructor
             elif isinstance(value, list):
-                # Handle lists containing dictionaries
                 new_list = []
                 for item in value:
                     if isinstance(item, dict) and not isinstance(item, Config):
-                        new_list.append(Config(item)) # Convert dicts in lists
+                        new_list.append(Config(item))
                     else:
-                        new_list.append(item) # Keep other items as is
+                        new_list.append(item)
                 self[key] = new_list
 
-
     # --- Attribute Access Magic Methods ---
-
     def __getattr__(self, name: str) -> Any:
         """Allows accessing dictionary keys as attributes (e.g., cfg.key)."""
-        # Check if the key exists using standard dict access (__getitem__)
-        # This will raise KeyError if the key is missing.
         try:
-            value = self[name]
-            log.debug(f"DEBUG [confy.__getattr__]: Accessed key '{name}' successfully.")
+            value = self[name] # Use standard dict access
+            log.debug(f"DEBUG [confy.__getattr__]: Accessed key '{name}'.")
             return value
         except KeyError:
-            # Convert KeyError to AttributeError for getattr behavior
             log.debug(f"DEBUG [confy.__getattr__]: Key '{name}' not found. Raising AttributeError.")
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'") from None
 
     def __setattr__(self, name: str, value: Any):
         """Allows setting dictionary keys as attributes (e.g., cfg.key = value)."""
-        # Use standard dict item assignment (__setitem__)
         log.debug(f"DEBUG [confy.__setattr__]: Setting '{name}' = {value!r}")
-        self[name] = value
+        self[name] = value # Use standard dict access
 
     def __delattr__(self, name: str):
         """Allows deleting dictionary keys using attribute deletion (e.g., del cfg.key)."""
-        # Use standard dict item deletion (__delitem__)
         try:
             log.debug(f"DEBUG [confy.__delattr__]: Deleting '{name}'")
-            del self[name]
+            del self[name] # Use standard dict access
         except KeyError:
-            # Convert KeyError to AttributeError for delattr behavior
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'") from None
 
     # --- Utility Methods ---
-
     def get(self, key: str, default: Any = None) -> Any:
         """Provides dictionary-like .get() access using dot-notation."""
-        try:
-            return get_by_dot(self, key) # Use self
-        except KeyError:
-            return default
+        try: return get_by_dot(self, key)
+        except KeyError: return default
 
     def as_dict(self) -> dict:
-        """
-        Returns a standard dictionary representation, recursively converting
-        nested Config objects back to plain dicts.
-        """
+        """Returns standard dict representation, recursively converting nested Configs."""
         plain_dict = {}
         for key, value in self.items():
-            if isinstance(value, Config):
-                plain_dict[key] = value.as_dict() # Recurse
+            if isinstance(value, Config): plain_dict[key] = value.as_dict()
             elif isinstance(value, list):
-                plain_dict[key] = [
-                    item.as_dict() if isinstance(item, Config) else item
-                    for item in value
-                ] # Handle lists
-            else:
-                plain_dict[key] = value
+                plain_dict[key] = [item.as_dict() if isinstance(item, Config) else item for item in value]
+            else: plain_dict[key] = value
         return plain_dict
 
     def __repr__(self) -> str:
         """String representation."""
-        # Use the standard dict repr for clarity
         return f"{type(self).__name__}({super().__repr__()})"
 
-    def __contains__(self, key: str) -> bool:
-        """Allows checking key existence with 'in' using dot-notation."""
+    # --- REVISED __contains__ ---
+    def __contains__(self, key: Any) -> bool:
+        """
+        Checks key existence. Handles both top-level and dot-notation keys.
+        Avoids recursion by calling the fixed get_by_dot.
+        """
+        if not isinstance(key, str): # Handle non-string keys if necessary
+             return super().__contains__(key)
         try:
-            get_by_dot(self, key) # Use self
+            get_by_dot(self, key) # Check existence using the fixed method
             return True
         except KeyError:
             return False
+    # --- END REVISED __contains__ ---
