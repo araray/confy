@@ -1,3 +1,4 @@
+# confy/loader.py
 """
 confy.loader
 ------------
@@ -10,314 +11,778 @@ Requires Python 3.10+.
 
 import os
 import json
-# Use tomli for reading TOML (works for Python 3.10+)
-import tomli
-from typing import Mapping, Any
-import logging
 import copy # For deepcopy
+import logging
+from typing import Mapping, Any, Union, Dict, List, Optional
+
+# Use tomli for reading TOML (works for Python 3.10+)
+try:
+    import tomli
+except ImportError:
+    try: import tomllib as tomli # Python 3.11+
+    except ImportError: tomli = None
+
 # Import load_dotenv from python-dotenv
-from dotenv import load_dotenv
+try: from dotenv import load_dotenv, find_dotenv # Added find_dotenv for check
+except ImportError: load_dotenv, find_dotenv = None, None
 
 from .exceptions import MissingMandatoryConfig
 
 log = logging.getLogger(__name__) # Logger for confy loader
 
-def deep_merge(a: dict, b: dict) -> dict:
-    """Recursively merge dict b into dict a; values in b take precedence."""
-    for k, v in b.items():
-        if k in a and isinstance(a[k], dict) and isinstance(v, dict):
-            a[k] = deep_merge(a[k], v)
+# --- Helper Functions ---
+
+def deep_merge(base: dict, updates: dict) -> dict:
+    """
+    Recursively merge the `updates` dictionary into the `base` dictionary.
+
+    - Creates a deep copy of `base` to avoid modifying the original.
+    - Iterates through `updates`:
+        - If a key exists in `base` and BOTH corresponding values are DICTIONARIES
+          (including dict subclasses like Config), it merges them recursively.
+        - Otherwise (key not in `base`, or either value is not a dictionary -
+          e.g., list, bool, int, str), the value from `updates` completely
+          overwrites the value in `base`.
+
+    Args:
+        base: The base dictionary (or Config object).
+        updates: The dictionary with updates to merge into `base`.
+
+    Returns:
+        A new dictionary representing the merged result.
+    """
+    # Start with a deep copy of 'base'.
+    merged = copy.deepcopy(base)
+
+    for key, value_updates in updates.items():
+        value_base = merged.get(key)
+
+        # Check if both values are dictionary-like (standard dict or Config)
+        # Use isinstance to handle dict subclasses correctly.
+        is_dict_like_base = isinstance(value_base, dict)
+        is_dict_like_updates = isinstance(value_updates, dict)
+
+        if is_dict_like_base and is_dict_like_updates:
+            # Both are dictionary-like, merge recursively
+            merged[key] = deep_merge(value_base, value_updates)
         else:
-            a[k] = v
-    return a
+            # If either value is not a dictionary (e.g., list, bool, int, str),
+            # or the key is new in 'updates', the value from `updates` overwrites.
+            # Ensure Config objects from updates are preserved, not just deepcopied
+            if isinstance(value_updates, Config):
+                 merged[key] = value_updates # Assign Config object directly
+            else:
+                 merged[key] = copy.deepcopy(value_updates)
+            # log.debug(f"deep_merge: Overwriting key '{key}' with value type {type(value_updates).__name__}")
 
-def set_by_dot(cfg: dict, key: str, value: Any):
-    """Set a nested dict value given a dot-notated key."""
+    return merged
+
+
+def set_by_dot(cfg: Union[dict, 'Config'], key: str, value: Any, create_missing: bool = True):
+    """
+    Set a nested dictionary value using a dot-notated key string.
+
+    Works on both standard dicts and Config objects.
+    Creates intermediate dictionaries along the path if they do not exist,
+    unless create_missing is False. If a part of the path exists but is not a
+    dictionary, it will be overwritten with a new dictionary (a warning will
+    be logged) only if create_missing is True.
+
+    Args:
+        cfg: The dictionary or Config object to modify.
+        key: The dot-notation string representing the path (e.g., "database.host").
+        value: The value to set at the specified path.
+        create_missing: If True, create intermediate dicts. If False, raise
+                        KeyError or TypeError if the path is invalid.
+
+    Raises:
+        KeyError: If a key part is not found and create_missing is False.
+        TypeError: If a path segment is not a dict and create_missing is False.
+    """
     parts = key.split('.')
-    d = cfg
-    for p in parts[:-1]:
-        if p not in d or not isinstance(d[p], dict):
-            d[p] = {}
-        d = d[p]
-    d[parts[-1]] = value
+    d = cfg # Start traversal from the root dictionary/Config
+    # Traverse the path up to the second-to-last part
+    for i, p in enumerate(parts[:-1]):
+        current_val = d.get(p) # Use .get() for safe access on both dict/Config
 
-def get_by_dot(cfg: dict, key: str) -> Any:
-    """Retrieve a nested dict value by dot-notated key using direct access."""
-    d = cfg
+        if not isinstance(current_val, (dict, Config)): # Check if it's dict-like
+            if not create_missing:
+                if p not in d:
+                    raise KeyError(f"Path segment '{p}' not found in key '{key}'")
+                else:
+                    raise TypeError(f"Path segment '{p}' (type: {type(current_val).__name__}) in key '{key}' is not a dictionary.")
+            # If create_missing is True:
+            if p in d:
+                 log.warning(f"Warning: Overwriting non-dictionary key '{p}' (type: {type(current_val).__name__}) in path '{key}' during set_by_dot.")
+            # Create a new dictionary (or Config if target is Config)
+            new_dict = Config({}) if isinstance(cfg, Config) else {}
+            d[p] = new_dict
+        # Move deeper into the dictionary structure
+        d = d[p]
+
+    # Set the value at the final key part
+    final_key = parts[-1]
+    if not create_missing and final_key not in d:
+        # If the final key itself is missing and we are not creating.
+        raise KeyError(f"Final key '{final_key}' not found in path '{key}'")
+
+    # Wrap value if setting within a Config object and value is a dict
+    if isinstance(d, Config) and isinstance(value, dict) and not isinstance(value, Config):
+         d[final_key] = Config(value)
+    else:
+         d[final_key] = value
+
+
+def get_by_dot(cfg: Union[Mapping, 'Config'], key: str) -> Any:
+    """
+    Retrieve a nested value from a Mapping (like dict or Config) using a dot-notated key.
+
+    Args:
+        cfg: The dictionary or Config object to retrieve from.
+        key: The dot-notation string representing the path (e.g., "database.host").
+
+    Returns:
+        The value found at the specified path.
+
+    Raises:
+        KeyError: If any part of the key path does not exist.
+        TypeError: If an attempt is made to access a key on a non-dictionary item
+                   during path traversal (e.g., accessing "a.b" when "a" is an integer).
+    """
+    d = cfg # Start traversal from the root
+    parts = key.split('.')
+    current_path_parts = [] # Keep track of the path traversed so far for error messages
     try:
-        for p in key.split('.'):
-            # Ensure d is dict-like before accessing key
-            if not hasattr(d, '__getitem__'):
-                 raise TypeError(f"Cannot access key '{p}' on non-dictionary item in path '{key}'")
-            d = d[p] # Direct access
+        for i, p in enumerate(parts):
+            current_path_parts.append(p)
+            # Ensure the current level 'd' is a dictionary-like object before indexing
+            # Check Mapping for dicts, Config for Config objects
+            if not isinstance(d, (Mapping, Config)):
+                 current_path = '.'.join(current_path_parts[:-1]) # Path up to the error point
+                 raise TypeError(f"Cannot access key '{p}' on non-dictionary item at path '{current_path}' (item type: {type(d).__name__})")
+
+            # Access the next level using standard item access (works for both dict and Config).
+            # This will raise KeyError if 'p' is not in 'd'.
+            d = d[p]
+
+        # Return the final value after successful traversal
         return d
     except KeyError as e:
-        missing_part = e.args[0] if e.args else p
-        raise KeyError(f"Key path '{key}' not found (missing part: '{missing_part}')") from None
+        # If a key is not found during traversal
+        missing_part = e.args[0] if e.args else p # Get the missing key from the exception or last part
+        found_path = '.'.join(current_path_parts[:-1]) # The valid path leading up to the missing part
+        raise KeyError(f"Key path '{key}' not found (missing part: '{missing_part}' at path '{found_path}')") from None
     except TypeError as e:
-        # Catch errors like trying d[p] when d is not a dict
+        # Catch other TypeErrors that might occur during access
         raise TypeError(f"Invalid access path '{key}': {e}") from e
 
-class Config(dict): # Inherit from dict
+def _parse_value(raw_value: Any) -> Any:
     """
-    Configuration class providing dot-notation access, inheriting from dict.
-    Loads configuration from defaults, file (.json/.toml), .env file,
-    environment variables, and overrides.
-    Ensures nested dictionaries are also accessible via dot notation.
+    Attempts to parse a string value into Python types (bool, int, float, JSON list/dict).
 
-    Loading Precedence:
-    1. Defaults
-    2. Config file (JSON/TOML)
-    3. .env file variables (loaded into environment)
-    4. Environment variables (including those from .env, potentially overridden by explicit env vars)
-    5. Overrides dictionary
+    Handles common string representations like 'true', 'false', 'null', numbers.
+    Attempts JSON decoding for strings starting with '{', '[', or '"'.
+    Falls back to the original string if no specific parsing rule applies.
+
+    Args:
+        raw_value: The value to parse. If not a string, it's returned directly.
+
+    Returns:
+        The parsed value (bool, int, float, list, dict, None) or the original value.
+    """
+    # If the input is not a string, return it as is.
+    if not isinstance(raw_value, str):
+        return raw_value
+
+    stripped_val = raw_value.strip()
+    # log.debug(f"DEBUG [_parse_value]: Attempting to parse '{stripped_val}' (original: '{raw_value}')")
+
+    # Explicit checks for boolean and null strings (case-insensitive)
+    lower_val = stripped_val.lower()
+    if lower_val == 'true':
+        # log.debug("DEBUG [_parse_value]: Parsed as True (boolean)")
+        return True
+    if lower_val == 'false':
+        # log.debug("DEBUG [_parse_value]: Parsed as False (boolean)")
+        return False
+    if lower_val == 'null':
+        # log.debug("DEBUG [_parse_value]: Parsed as None")
+        return None
+
+    # Attempt to parse as integer
+    try:
+        result = int(stripped_val)
+        # log.debug(f"DEBUG [_parse_value]: Parsed as {result} (integer)")
+        return result
+    except ValueError:
+        # If not int, attempt to parse as float
+        try:
+            result = float(stripped_val)
+            # log.debug(f"DEBUG [_parse_value]: Parsed as {result} (float)")
+            return result
+        except ValueError:
+            # If not a simple number, proceed to JSON check
+            pass
+
+    # Attempt to parse as JSON, but only if it looks like JSON
+    # (starts with '{', '[', or '"' for quoted strings)
+    try:
+        # Check if it looks like JSON before attempting to parse
+        if stripped_val.startswith(("{", "[", '"')) and len(stripped_val) > 1:
+             # Check if it ends appropriately for potential JSON structures
+             if (stripped_val.startswith("{") and stripped_val.endswith("}")) or \
+                (stripped_val.startswith("[") and stripped_val.endswith("]")) or \
+                (stripped_val.startswith('"') and stripped_val.endswith('"')):
+                 result = json.loads(stripped_val)
+                 # log.debug(f"DEBUG [_parse_value]: Parsed as JSON: {result}")
+                 return result
+    except json.JSONDecodeError:
+        # If JSON parsing fails, it's likely just a plain string
+        # log.debug("DEBUG [_parse_value]: Failed to parse as JSON.")
+        pass
+
+    # Fallback: return the original string value if no other parsing matched.
+    # log.debug(f"DEBUG [_parse_value]: Falling back to original string: '{raw_value}'")
+    return raw_value
+
+# --- Config Class ---
+
+class Config(dict):
+    """
+    Configuration class providing dictionary-like access with dot-notation.
+
+    Inherits from `dict`, allowing standard dictionary operations. Adds functionality
+    for loading configuration from multiple sources with defined precedence and
+    accessing nested values using attribute-style dot notation (e.g., `cfg.database.host`).
+
+    Loading Precedence (lowest to highest priority):
+    1.  **Defaults dictionary (`defaults`)**: Base values provided programmatically.
+    2.  **Initial data (`*args`, `**kwargs`)**: Values passed directly during `Config` instantiation.
+    3.  **Config file (`file_path`)**: Values loaded from a specified JSON or TOML file.
+        *Special TOML Handling*: Keys within TOML sections (e.g., `list_items` under `[new_section]`)
+        may be "promoted" to the root level if they match a root-level key in `defaults`.
+    4.  **Environment variables (`prefix`)**: Values loaded from `os.environ`. This includes
+        variables potentially loaded from a `.env` file in Step 0. Environment variables
+        matching the specified `prefix` are processed using simple `_` to `.` conversion
+        (e.g., `MYAPP_DB_HOST` -> `db.host`). Values are parsed using `_parse_value`.
+        *Remapping*: After initialization and wrapping, a check is performed to see if dot-separated keys
+        from env vars (e.g., `feature.flags.new.ui`) correspond to existing underscore-separated keys
+        (e.g., `feature_flags.new_ui`). If so, the value is moved to the underscore key, and the
+        original dot-key structure is removed.
+    5.  **Overrides dictionary (`overrides_dict`)**: A dictionary where keys use dot-notation
+        to specify the target setting. Values are parsed using `_parse_value`. These have the highest precedence.
+
+    Nested dictionaries loaded from any source are automatically converted into `Config`
+    objects, allowing chained dot-notation access (e.g., `cfg.section.subsection.key`).
     """
 
-    def __init__(self, *args,
-                 file_path: str = None,
-                 prefix: str = None,
-                 overrides_dict: Mapping[str, object] = None,
-                 defaults: dict = None,
-                 mandatory: list[str] = None,
-                 load_dotenv_file: bool = True, # Option to control .env loading
-                 dotenv_path: str = None, # Specify custom .env path
-                 **kwargs):
+    def __init__(self,
+                 # --- Configuration Sources ---
+                 defaults: Optional[Dict[str, Any]] = None,
+                 file_path: Optional[str] = None,
+                 prefix: Optional[str] = None, # Prefix for environment variables
+                 overrides_dict: Optional[Mapping[str, Any]] = None, # Dot-notation keys for final overrides
+                 # --- Validation ---
+                 mandatory: Optional[List[str]] = None, # List of required dot-notation keys
+                 # --- .env File Handling ---
+                 load_dotenv_file: bool = True, # Whether to search for and load a .env file
+                 dotenv_path: Optional[str] = None, # Explicit path to a .env file
+                 # --- Direct Initialization (low precedence) ---
+                 *args, # Allow initializing with a dictionary, e.g., Config({'a': 1})
+                 **kwargs): # Allow initializing with keyword args, e.g., Config(a=1)
 
-        # Initialize the dictionary part first
-        initial_data = args[0] if args and isinstance(args[0], dict) else {}
-        initial_data.update(kwargs)
-        super().__init__(initial_data)
-
-        # --- Configuration Loading Logic ---
-        # This block runs *only* if this is the top-level Config object
-        if file_path is not None or defaults is not None or prefix is not None or load_dotenv_file:
-            log.debug(f"DEBUG [confy.__init__]: Initializing top-level Config.")
-
-            # 0. Load .env file into environment variables if requested
-            # This happens *before* reading explicit environment variables,
-            # allowing explicit env vars to override .env vars.
-            if load_dotenv_file:
-                dotenv_loaded = load_dotenv(dotenv_path=dotenv_path, override=False) # override=False: don't overwrite existing env vars
-                if dotenv_loaded:
-                    log.debug(f"DEBUG [confy.__init__]: Loaded environment variables from .env file (path: {dotenv_path or '.env'}).")
-                else:
-                    log.debug(f"DEBUG [confy.__init__]: No .env file found or loaded (path: {dotenv_path or '.env'}).")
-
-            # 1. Start with a deep copy of defaults
-            merged_data = copy.deepcopy(defaults) if defaults else {}
-            # 2. Merge initial data (from args/kwargs) into defaults copy
-            deep_merge(merged_data, self)
-
-            # 3. Load from file and merge
-            if file_path:
-                if not os.path.exists(file_path): raise FileNotFoundError(f"Config file not found: {file_path}")
-                ext = os.path.splitext(file_path)[1].lower()
-                try:
-                    # Use 'rb' for tomli, 'r' for json
-                    mode = 'rb' if ext == '.toml' else 'r'
-                    encoding = None if mode == 'rb' else 'utf-8' # Specify encoding for text files
-                    with open(file_path, mode=mode, encoding=encoding) as f:
-                        if ext == '.toml':
-                            # Use tomli.load for reading
-                            loaded = tomli.load(f)
-                        elif ext == '.json':
-                            loaded = json.load(f)
-                        else:
-                            raise ValueError(f"Unsupported config file type: {ext}")
-                    log.debug(f"DEBUG [confy.__init__]: Loaded from file {file_path}")
-                    deep_merge(merged_data, loaded)
-                except tomli.TOMLDecodeError as e:
-                     raise RuntimeError(f"Error decoding TOML file {file_path}: {e}") from e
-                except json.JSONDecodeError as e:
-                     raise RuntimeError(f"Error decoding JSON file {file_path}: {e}") from e
-                except Exception as e:
-                     raise RuntimeError(f"Error loading config file {file_path}: {e}") from e
-
-            # 4. Update self with the fully merged data up to this point
-            self.clear()
-            self.update(merged_data)
-            log.debug(f"DEBUG [confy.__init__]: Data after file/defaults merge.")
-
-            # 5. Apply environment variable overrides (will include those from .env)
-            if prefix:
-                self._apply_env(prefix)
-                log.debug(f"DEBUG [confy.__init__]: Applied environment variables with prefix '{prefix}'.")
-
-            # 6. Apply explicit overrides dictionary
-            if overrides_dict:
-                for key, val in overrides_dict.items():
-                    set_by_dot(self, key, val)
-                log.debug(f"DEBUG [confy.__init__]: Applied explicit overrides dictionary.")
-
-            # 7. Recursively wrap nested dictionaries *after* all merges/overrides
-            self._wrap_nested_dicts()
-            log.debug(f"DEBUG [confy.__init__]: Wrapped nested dicts.")
-
-            # 8. Enforce mandatory keys on the final structure
-            if mandatory:
-                self._validate_mandatory(mandatory)
-                log.debug(f"DEBUG [confy.__init__]: Validated mandatory keys.")
-            log.debug(f"DEBUG [confy.__init__]: Top-level Config initialization complete.")
-        else:
-            # If called for a nested dict (no file_path/defaults/prefix passed),
-            # just wrap its contents immediately.
-            self._wrap_nested_dicts()
-            log.debug(f"DEBUG [confy.__init__]: Initialized nested Config.")
+        # --- Step 0: Load .env File (Conditional) ---
+        # This loads into os.environ, making variables available for Step 1c
+        if load_dotenv_file:
+            self._load_dotenv_file(dotenv_path)
 
 
-    def _apply_env(self, prefix: str):
-        """Applies environment variable overrides directly to self."""
+        # --- Step 1: Collect Data from Each Source ---
+        # Use deepcopy to avoid modifying original input dicts
+        # These should all be plain dictionaries at this stage.
+        defaults_data = copy.deepcopy(defaults or {})
+        log.debug(f"DEBUG [confy.__init__]: Collected defaults_data: {defaults_data}")
+
+        args_kwargs_data = {}
+        initial_data_arg = args[0] if args and isinstance(args[0], dict) else {}
+        initial_data_kwarg = kwargs
+        args_kwargs_data = copy.deepcopy(initial_data_arg)
+        if initial_data_kwarg:
+            # Merge kwargs into the copied args_data
+            args_kwargs_data = deep_merge(args_kwargs_data, initial_data_kwarg)
+        log.debug(f"DEBUG [confy.__init__]: Collected args_kwargs_data: {args_kwargs_data}")
+
+        # Pass defaults_data to _load_config_file for potential TOML key promotion
+        file_data = self._load_config_file(file_path, defaults_data)
+        log.debug(f"DEBUG [confy.__init__]: Collected file_data: {file_data}")
+
+        # Collect env vars into a structured dict (simple _ -> . conversion)
+        env_data = self._collect_env_vars(prefix)
+        log.debug(f"DEBUG [confy.__init__]: Collected env_data: {env_data}")
+
+        overrides_data = self._structure_overrides(overrides_dict)
+        log.debug(f"DEBUG [confy.__init__]: Collected overrides_data: {overrides_data}")
+
+
+        # --- Step 2: Merge Collected Data Sequentially ---
+        # Start with defaults
+        final_merged_data = defaults_data
+        log.debug(f"DEBUG [confy.__init__]: Initial merge state (defaults): {final_merged_data}")
+
+        # Merge args/kwargs
+        if args_kwargs_data:
+            final_merged_data = deep_merge(final_merged_data, args_kwargs_data)
+            log.debug(f"DEBUG [confy.__init__]: After merging args/kwargs: {final_merged_data}")
+
+        # Merge file data
+        if file_data:
+            final_merged_data = deep_merge(final_merged_data, file_data)
+            log.debug(f"DEBUG [confy.__init__]: After merging file data: {final_merged_data}")
+
+        # Merge environment data
+        if env_data:
+            final_merged_data = deep_merge(final_merged_data, env_data)
+            log.debug(f"DEBUG [confy.__init__]: After merging env data: {final_merged_data}")
+
+        # Merge overrides data (highest precedence)
+        if overrides_data:
+            final_merged_data = deep_merge(final_merged_data, overrides_data)
+            log.debug(f"DEBUG [confy.__init__]: After merging overrides data: {final_merged_data}")
+
+        log.debug("DEBUG [confy.__init__]: Final merged data before super().__init__: %s", final_merged_data)
+
+
+        # --- Step 3: Initialize Self and Wrap Nested Structures ---
+        # Initialize the Config object with the *final*, fully merged dictionary.
+        super().__init__(final_merged_data)
+        log.debug("DEBUG [confy.__init__]: Initialized self with final merged data.")
+
+        # Wrap nested dicts/lists *after* initialization is complete.
+        self._wrap_nested_items(self)
+        log.debug("DEBUG [confy.__init__]: Wrapped nested items in self.")
+
+        # --- Step 4: Remap Environment Variable Keys (Post-Initialization) ---
+        # Correct env var mappings like 'feature.flags.new.ui' to 'feature_flags.new_ui'
+        # if the latter exists from defaults/file. Operates on the wrapped 'self'.
+        if env_data: # Only run if environment variables were processed
+            self._remap_env_keys_post_init(env_data)
+            log.debug(f"DEBUG [confy.__init__]: After remapping env keys post-init: {self}")
+
+
+        # --- Step 5: Validate Mandatory Keys ---
+        if mandatory:
+             self._validate_mandatory(mandatory)
+             log.debug("DEBUG [confy.__init__]: Validated mandatory keys.")
+
+        log.debug("DEBUG [confy.__init__]: Config initialization complete.")
+
+
+    def _load_dotenv_file(self, dotenv_path: Optional[str]):
+        """Loads .env file into os.environ if python-dotenv is available."""
+        if not load_dotenv:
+            # Check existence only if load_dotenv isn't None (i.e., import failed) and warn if found
+            effective_dotenv_path = dotenv_path or ".env" # Simple check if find_dotenv not available
+            exists = False
+            try:
+                if not dotenv_path and find_dotenv: effective_dotenv_path = find_dotenv(usecwd=True) or effective_dotenv_path
+                exists = os.path.exists(effective_dotenv_path)
+            except Exception: pass # Ignore errors checking existence
+            if exists: log.warning("Warning: python-dotenv not installed, cannot load .env file found at %s.", effective_dotenv_path)
+            # else: log.debug("DEBUG [confy._load_dotenv_file]: python-dotenv not installed, skipping .env load.")
+            return
+
+        try:
+            # Use find_dotenv to locate the file if no explicit path is given
+            actual_dotenv_path = dotenv_path or find_dotenv(usecwd=True) # find_dotenv searches cwd and parents
+            if actual_dotenv_path and os.path.exists(actual_dotenv_path):
+                dotenv_was_loaded = load_dotenv(dotenv_path=actual_dotenv_path, override=False)
+                if dotenv_was_loaded: log.debug(f"DEBUG [confy._load_dotenv_file]: Loaded .env file from: {actual_dotenv_path}.")
+                else: log.debug(f"DEBUG [confy._load_dotenv_file]: .env file found at {actual_dotenv_path} but did not load (all variables might already exist in env).")
+            # else:
+                # log.debug(f"DEBUG [confy._load_dotenv_file]: No .env file found to load (searched path: {dotenv_path or 'auto'}).")
+        except Exception as e:
+            log.warning(f"Warning: Failed during .env file loading (path: {dotenv_path or 'auto'}): {e}")
+
+
+    def _load_config_file(self, file_path: Optional[str], defaults_data: Optional[Dict] = None) -> dict:
+        """
+        Loads and parses JSON or TOML config file.
+
+        For TOML files, if a key within a top-level section matches a root-level
+        key in defaults_data, it's promoted to the root of the loaded data.
+        """
+        if not file_path:
+            return {}
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Config file not found: {file_path}")
+
+        ext = os.path.splitext(file_path)[1].lower()
+        file_content = None
+        try:
+            if ext == '.toml':
+                if not tomli: raise RuntimeError("tomli (or tomllib) is required for TOML support.")
+                with open(file_path, mode='rb') as f: file_content = tomli.load(f)
+
+                # --- TOML Key Promotion Logic ---
+                if file_content and defaults_data:
+                    root_default_keys = set(defaults_data.keys())
+                    promoted_keys = set()
+                    # Iterate through a copy of items to allow modification
+                    for section_key, section_data in list(file_content.items()):
+                        if isinstance(section_data, dict):
+                            # Check keys within this section
+                            section_keys = set(section_data.keys())
+                            keys_to_promote = root_default_keys.intersection(section_keys)
+                            for key_to_promote in keys_to_promote:
+                                # Promote only if not already at root or promoted from another section
+                                if key_to_promote not in file_content or key_to_promote in promoted_keys:
+                                    log.debug(f"Promoting TOML key '{key_to_promote}' from section '[{section_key}]' to root.")
+                                    file_content[key_to_promote] = section_data.pop(key_to_promote)
+                                    promoted_keys.add(key_to_promote)
+                                else:
+                                     log.warning(f"Skipping promotion of TOML key '{key_to_promote}' from section '[{section_key}]' as it already exists at the root.")
+                            # Clean up empty section if all keys were promoted
+                            if not section_data:
+                                 log.debug(f"Removing empty TOML section '[{section_key}]' after key promotion.")
+                                 del file_content[section_key]
+                # --- End TOML Key Promotion ---
+
+            elif ext == '.json':
+                with open(file_path, mode='r', encoding='utf-8') as f: file_content = json.load(f)
+            else:
+                raise ValueError(f"Unsupported config file type: {ext}")
+        except Exception as e:
+            raise RuntimeError(f"Error loading/parsing file {file_path}: {e}") from e
+
+        # Return deepcopy to prevent modification of cached file content if reused
+        return copy.deepcopy(file_content) if file_content else {}
+
+
+    @staticmethod
+    def _collect_env_vars(prefix: Optional[str]) -> dict:
+        """
+        Collects environment variables matching the prefix into a structured dictionary.
+        Uses simple underscore-to-dot conversion. Values are parsed using _parse_value.
+        Remapping based on existing structure happens later in __init__.
+        """
+        env_data = {}
         applied_count = 0
-        # Ensure prefix ends with exactly one underscore
-        prefix = prefix.rstrip('_') + '_'
-        plen = len(prefix)
-        # Iterate over a copy of os.environ in case .env modified it during iteration
-        for var, raw in os.environ.copy().items():
-            if var.startswith(prefix):
-                dot_key = var[plen:].lower().replace("_", ".")
-                if not dot_key: continue # Skip if only prefix matches
+        prefix_match = ""
+        # Normalize prefix: ensure it ends with '_' if not empty
+        if prefix is not None:
+            prefix = prefix.strip()
+            if prefix: prefix_match = prefix.rstrip('_') + '_'
+        plen = len(prefix_match)
+        prefix_upper = prefix_match.upper() # Use uppercase for matching
+
+        log.debug(f"DEBUG [confy._collect_env_vars]: Checking {len(os.environ)} env vars with prefix '{prefix}' (match pattern: '{prefix_upper}*')")
+        for var, raw_value in os.environ.items():
+            var_upper = var.upper() # Compare uppercase var name
+            # Check if var starts with prefix (or if prefix is empty, consider all vars)
+            should_process = False
+            if prefix_upper and var_upper.startswith(prefix_upper):
+                should_process = True
+            elif not prefix_upper and prefix == "": # Handle prefix="" case (match all)
+                should_process = True
+
+            if should_process:
+                 key_part = var[plen:] # Get the part after the prefix
+                 # Simple conversion: lowercase, replace all underscores with dots
+                 dot_key = key_part.lower().replace("_", ".")
+                 # Skip if the resulting key is empty (e.g., prefix was the entire var name)
+                 if not dot_key and prefix != "": continue
+
+                 log.debug(f"DEBUG [confy._collect_env_vars]: Processing env var '{var}' -> dot_key '{dot_key}'")
+                 val = _parse_value(raw_value) # Parse the value
+                 try:
+                     # Set using dot notation, creating intermediate dicts
+                     set_by_dot(env_data, dot_key, val, create_missing=True)
+                     applied_count += 1
+                 except Exception as e:
+                     log.error(f"Error processing environment variable '{var}' (key: '{dot_key}') into structure: {e}")
+        log.debug(f"DEBUG [confy._collect_env_vars]: Collected {applied_count} env vars into dict structure: {env_data}")
+        return env_data # Return the structured dict
+
+
+    def _remap_env_keys_post_init(self, env_data: dict):
+        """
+        Remaps dot-separated keys (from env_data) to underscore-separated keys
+        within the initialized `self` (Config object) if the underscore version
+        already exists. Modifies `self` in-place.
+        """
+        # Flatten the original env_data to get all potential dot-keys generated
+        flat_env_keys = self._flatten_keys(env_data)
+        log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Starting remap check. Flat env keys: {list(flat_env_keys)}")
+
+        keys_to_remove = [] # Store dot-keys that get successfully remapped
+
+        for dot_key in flat_env_keys:
+            if '.' not in dot_key: continue # Only consider keys with dots that came from env vars
+
+            # Construct the potential underscore version of the key
+            underscore_key = dot_key.replace('.', '_')
+            log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Checking if underscore_key '{underscore_key}' exists for dot_key '{dot_key}'")
+
+            # Check if the underscore version exists in `self` using __contains__
+            # which handles dot-notation correctly on the Config object.
+            if self.__contains__(underscore_key):
+                log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Underscore key '{underscore_key}' exists.")
                 try:
-                    # Attempt to parse as JSON first (handles bools, numbers, lists, dicts)
-                    val = json.loads(raw)
-                except json.JSONDecodeError:
-                    # Fallback to raw string if not valid JSON
-                    val = raw
+                    # Get the value from the original dot-key location in `self`
+                    value_to_move = get_by_dot(self, dot_key)
+                    log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Found value '{value_to_move}' at dot_key '{dot_key}'.")
+
+                    # Check if the target (underscore_key) is a dictionary and value is also a dict
+                    target_val = self.get(underscore_key) # Use get on self
+                    target_is_dict = isinstance(target_val, (dict, Config))
+                    value_is_dict = isinstance(value_to_move, (dict, Config))
+
+                    # Set the value at the underscore-key location in `self`
+                    # Use create_missing=False to ensure we only overwrite existing structure.
+                    if target_is_dict and value_is_dict:
+                         log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Merging dict from '{dot_key}' into existing dict at '{underscore_key}'.")
+                         # Perform merge directly on the target Config object if possible
+                         target_node = get_by_dot(self, underscore_key)
+                         if isinstance(target_node, (dict, Config)):
+                              merged_dict = deep_merge(target_node, value_to_move)
+                              # Need to set the merged result back carefully
+                              set_by_dot(self, underscore_key, merged_dict, create_missing=False)
+                         else: # Should not happen if target_is_dict is true, but safety check
+                              log.warning(f"Target for merge '{underscore_key}' is not a dict/Config. Overwriting.")
+                              set_by_dot(self, underscore_key, value_to_move, create_missing=False)
+                    else:
+                         log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Moving value from '{dot_key}' to '{underscore_key}'.")
+                         set_by_dot(self, underscore_key, value_to_move, create_missing=False)
+
+                    # Mark the original dot-key for removal *after* successful move/merge
+                    keys_to_remove.append(dot_key)
+
+                except (KeyError, TypeError) as e:
+                    # This might happen if the dot_key path became invalid after merges/wrapping
+                    log.warning(f"Could not retrieve value for dot-key '{dot_key}' during remapping: {e}")
                 except Exception as e:
-                    log.warning(f"Warning: Could not JSON parse env var {var}: {e}. Using raw string.")
-                    val = raw
-
-                try:
-                    set_by_dot(self, dot_key, val)
-                    applied_count += 1
-                except Exception as e:
-                    # Catch potential errors during set_by_dot if the path is invalid
-                    log.error(f"Error applying environment variable {var} (key: {dot_key}): {e}")
-
-        log.debug(f"DEBUG [confy._apply_env]: Applied {applied_count} env vars with prefix '{prefix}'.")
+                    log.error(f"Unexpected error during remapping for key '{dot_key}': {e}")
+            else:
+                 log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Underscore key '{underscore_key}' does not exist. Skipping remap for '{dot_key}'.")
 
 
-    def _validate_mandatory(self, keys: list[str]):
+        # Remove the original dot-separated keys that were successfully remapped
+        if keys_to_remove:
+             log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Removing original dot-keys after remapping: {keys_to_remove}")
+             # Sort keys by length descending to remove deeper keys first, preventing
+             # removal of a parent before its child.
+             keys_to_remove.sort(key=lambda k: k.count('.'), reverse=True)
+             for key in keys_to_remove:
+                 parts = key.split('.')
+                 parent = self
+                 try:
+                     # Traverse to the parent dictionary/Config object
+                     for p in parts[:-1]:
+                         parent = parent[p] # Traverse using dict access
+
+                     # Delete the final key from the parent
+                     final_key = parts[-1]
+                     if isinstance(parent, (dict, Config)) and final_key in parent:
+                         del parent[final_key]
+                         log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Removed '{final_key}' from parent for key '{key}'.")
+                         # Optional: Clean up empty parent dicts? Might be complex/risky.
+                         # Consider if 'feature.flags' should be removed if 'new.ui' was its only content.
+                         # For now, leave potentially empty parent structures.
+                     else:
+                          log.warning(f"Final key '{final_key}' or its parent not found for deletion of original dot-key '{key}'. Parent type: {type(parent)}")
+
+                 except (KeyError, TypeError) as e:
+                     log.warning(f"Warning: Could not cleanly remove original dot-key '{key}' after remapping: {e}")
+
+
+    @staticmethod
+    def _flatten_keys(d: dict, prefix: str = "") -> list:
+        """Helper to get a flat list of all dot-notation keys in a dict."""
+        keys = []
+        for k, v in d.items():
+            new_key = f"{prefix}.{k}" if prefix else k
+            # We only care about the keys themselves for the remapping trigger
+            keys.append(new_key)
+            if isinstance(v, dict):
+                keys.extend(Config._flatten_keys(v, new_key))
+            # We don't need to flatten lists for this specific purpose
+        return keys
+
+
+    @staticmethod
+    def _structure_overrides(overrides_dict: Optional[Mapping[str, Any]]) -> dict:
+        """Converts flat overrides dict with dot-keys into a structured dict."""
+        if not overrides_dict:
+            return {}
+
+        structured_overrides = {}
+        for key, raw_val in overrides_dict.items():
+             try:
+                 # Parse the value from the overrides dict before setting
+                 parsed_val = _parse_value(raw_val)
+                 # Use create_missing=True for overrides
+                 set_by_dot(structured_overrides, key, parsed_val, create_missing=True)
+             except Exception as e:
+                 log.error(f"Error processing override key '{key}': {e}")
+
+        # Return deepcopy to prevent modification of input dict
+        return copy.deepcopy(structured_overrides)
+
+
+    @staticmethod
+    def _wrap_nested_items(data: Union[Dict, List, 'Config']):
+        """Recursively wraps nested dicts in Config objects *in-place*."""
+        if isinstance(data, (dict, Config)): # Operate on dict or Config directly
+            # Iterate over keys snapshot because we might modify the dict/Config
+            for key in list(data.keys()):
+                value = data[key]
+                if isinstance(value, dict):
+                    # Only wrap if it's not already a Config object
+                    if not isinstance(value, Config):
+                        data[key] = Config(value) # Wrap plain dict
+                        # Recurse into the newly wrapped object
+                        Config._wrap_nested_items(data[key])
+                    else:
+                        # If already a Config object, just recurse into it
+                        # This ensures its children are also wrapped if necessary
+                        Config._wrap_nested_items(value)
+                elif isinstance(value, list):
+                    # If the value is a list, recurse into the list
+                    Config._wrap_nested_items(value) # Process list items
+        elif isinstance(data, list):
+            # Iterate over list indices
+            for i, item in enumerate(data):
+                if isinstance(item, dict):
+                     # Only wrap if it's not already a Config object
+                    if not isinstance(item, Config):
+                        data[i] = Config(item) # Wrap plain dict in list
+                        # Recurse into the newly wrapped object
+                        Config._wrap_nested_items(data[i])
+                    else:
+                        # If already a Config object, just recurse into it
+                        Config._wrap_nested_items(item)
+                elif isinstance(item, list):
+                    # If the item is a list, recurse into it
+                    Config._wrap_nested_items(item)
+
+    def _validate_mandatory(self, keys: List[str]):
         """Checks for mandatory keys using get_by_dot."""
         missing = []
+        log.debug(f"DEBUG [confy._validate_mandatory]: Checking mandatory keys: {keys}")
         for k in keys:
-            try:
-                get_by_dot(self, k)
-            except KeyError:
+            try: get_by_dot(self, k) # Attempt to retrieve the key
+            except (KeyError, TypeError) as e:
+                log.debug(f"DEBUG [confy._validate_mandatory]: Mandatory key '{k}' MISSING or path invalid. Error: {e}")
                 missing.append(k)
-            except TypeError as e:
-                # This might happen if a mandatory key path is invalid
-                log.error(f"Error validating mandatory key '{k}': {e}")
-                missing.append(k) # Treat as missing if path is invalid
-        if missing:
-            raise MissingMandatoryConfig(missing)
-        log.debug(f"DEBUG [confy._validate_mandatory]: All mandatory keys present: {keys}")
-
-
-    def _wrap_nested_dicts(self):
-        """Recursively converts nested dicts to Config objects."""
-        # Use list(self.items()) to iterate over a snapshot, allowing modification
-        for key, value in list(self.items()):
-            if isinstance(value, dict):
-                # Ensure we don't re-wrap an already wrapped Config object
-                if not isinstance(value, Config):
-                    # Convert plain dict to Config object, passing the dict as initial data
-                    # Do not pass other init args like file_path here
-                    self[key] = Config(value)
-            elif isinstance(value, list):
-                # Handle lists containing dictionaries
-                new_list = []
-                for i, item in enumerate(value):
-                    if isinstance(item, dict) and not isinstance(item, Config):
-                         # Convert dicts in lists, do not pass other init args
-                        new_list.append(Config(item))
-                    else:
-                        new_list.append(item) # Keep other items as is
-                # Only update if the list actually changed
-                if new_list != value:
-                    self[key] = new_list
-
+        if missing: raise MissingMandatoryConfig(missing)
 
     # --- Attribute Access Magic Methods ---
-
     def __getattr__(self, name: str) -> Any:
-        """Allows accessing dictionary keys as attributes (e.g., cfg.key)."""
-        # Prevent access to private/protected attributes or methods
+        # Prevent access to private/magic methods via getattr
         if name.startswith('_'):
-             raise AttributeError(f"Attempted to access private attribute: {name}")
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         try:
-            # Standard dictionary access (__getitem__)
-            value = self[name]
-            # log.debug(f"DEBUG [confy.__getattr__]: Accessed key '{name}'. Type: {type(value)}")
-            return value
+            # Retrieve item using standard dictionary access
+            return self[name]
         except KeyError:
-            # If key doesn't exist, raise AttributeError as expected
-            # log.debug(f"DEBUG [confy.__getattr__]: Key '{name}' not found. Raising AttributeError.")
+            # Raise AttributeError if key doesn't exist, standard behavior
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'") from None
 
     def __setattr__(self, name: str, value: Any):
-        """Allows setting dictionary keys as attributes (e.g., cfg.key = value)."""
-        # Prevent setting private/protected attributes directly
+        # Handle private attributes normally
         if name.startswith('_'):
-             super().__setattr__(name, value) # Allow internal assignments
-             return
+            super().__setattr__(name, value)
+            return
 
-        # If the value being assigned is a dict, wrap it in Config
+        # Wrap dictionaries and lists being assigned
+        wrapped_value = value
         if isinstance(value, dict) and not isinstance(value, Config):
-             # Do not pass other init args when wrapping
-             wrapped_value = Config(value)
-        else:
-             wrapped_value = value
+            # Wrap plain dicts into Config objects
+            wrapped_value = Config(value)
+            # Ensure nested items within the newly assigned dict are also wrapped
+            self._wrap_nested_items(wrapped_value)
+        elif isinstance(value, list):
+            # Deep copy the list and wrap its contents recursively
+            new_list = copy.deepcopy(value)
+            self._wrap_nested_items(new_list) # Wrap items within the new list
+            wrapped_value = new_list
 
-        # log.debug(f"DEBUG [confy.__setattr__]: Setting '{name}' = {wrapped_value!r}")
-        # Use standard dictionary assignment (__setitem__)
+        # Set the item using standard dictionary access
         self[name] = wrapped_value
 
     def __delattr__(self, name: str):
-        """Allows deleting dictionary keys using attribute deletion (e.g., del cfg.key)."""
+        # Prevent deletion of private/magic attributes
         if name.startswith('_'):
-             raise AttributeError(f"Cannot delete private attribute: {name}")
+            raise AttributeError(f"Cannot delete private attribute: {name}")
         try:
-            # log.debug(f"DEBUG [confy.__delattr__]: Deleting '{name}'")
-            del self[name] # Use standard dictionary deletion (__delitem__)
+            # Delete item using standard dictionary access
+            del self[name]
         except KeyError:
+            # Raise AttributeError if key doesn't exist
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'") from None
 
-    # --- Utility Methods ---
-
+    # --- Dictionary-like Methods supporting dot-notation ---
     def get(self, key: str, default: Any = None) -> Any:
-        """Provides dictionary-like .get() access using dot-notation."""
+        """
+        Retrieve a value using dot-notation, returning default if not found.
+        """
         try:
+            # Use the helper function for robust nested access
             return get_by_dot(self, key)
-        except KeyError:
+        except (KeyError, TypeError):
+            # Return the default value if the key path is invalid or not found
             return default
-        except TypeError: # Handle cases where the path is invalid during lookup
-             return default
 
+    def __contains__(self, key: Any) -> bool:
+        """
+        Check for key existence, supporting dot-notation for string keys.
+        Avoids recursion by trying get_by_dot and catching exceptions.
+        """
+        # Use standard __contains__ for non-string keys or private keys
+        if not isinstance(key, str) or key.startswith('_'):
+            return super().__contains__(key)
+        try:
+            # Attempt to get the value using dot notation.
+            # If successful, the key exists.
+            get_by_dot(self, key)
+            return True
+        except (KeyError, TypeError):
+            # If get_by_dot fails, the key path does not exist.
+            return False
+
+    # --- Utility Methods ---
     def as_dict(self) -> dict:
-        """Returns standard dict representation, recursively converting nested Configs."""
+        """
+        Return the configuration as a standard Python dictionary.
+
+        Recursively converts nested Config objects back into plain dictionaries.
+        """
         plain_dict = {}
         for key, value in self.items():
             if isinstance(value, Config):
+                # Recursively convert nested Config objects
                 plain_dict[key] = value.as_dict()
             elif isinstance(value, list):
-                plain_dict[key] = [item.as_dict() if isinstance(item, Config) else item for item in value]
+                # Process lists: convert Config objects within lists
+                plain_dict[key] = [
+                    item.as_dict() if isinstance(item, Config) else copy.deepcopy(item)
+                    for item in value
+                ]
             else:
-                plain_dict[key] = value
+                # Deep copy other values to ensure independence
+                plain_dict[key] = copy.deepcopy(value)
         return plain_dict
 
+    # --- Standard Representation Methods ---
     def __repr__(self) -> str:
-        """String representation."""
-        # Use as_dict() for a cleaner representation of the contents
-        return f"{type(self).__name__}({self.as_dict()})"
+        # Provide a representation similar to a standard dict
+        return f"{type(self).__name__}({super().__repr__()})"
 
-    def __contains__(self, key: Any) -> bool:
-        """Checks key existence using dot-notation for strings."""
-        if not isinstance(key, str):
-            return super().__contains__(key)
+    def __str__(self) -> str:
+        """Return a JSON representation of the configuration."""
         try:
-            get_by_dot(self, key)
-            return True
-        except KeyError:
-            return False
-        except TypeError: # Path is invalid
-            return False
+            # Use as_dict() to get the plain dictionary structure for serialization
+            return json.dumps(self.as_dict(), indent=2)
+        except Exception:
+             # Fallback to standard repr if JSON serialization fails
+            return repr(self)
