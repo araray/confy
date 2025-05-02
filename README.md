@@ -7,7 +7,7 @@
 - Access settings intuitively via **dot-notation** (e.g., `cfg.database.host`).
 - Define **default values** to ensure settings always have a fallback.
 - Enforce **mandatory** configuration keys, raising errors if they are missing.
-- Override any setting through **environment variables**, supporting prefixes (e.g., `MYAPP_DATABASE_PORT=5432`).
+- Override any setting through **environment variables**, supporting prefixes (e.g., `MYAPP_DATABASE_PORT=5432`). See [Environment Overrides Explained](#environment-overrides-explained) for details on underscore mapping.
 - Apply final overrides using a standard Python **dictionary**, ideal for integrating with command-line argument parsers like `argparse` or `click`.
 - Inspect (`get`, `dump`, `search`, `exists`) and **mutate** (`set`, `convert`) configuration files directly from the command line using the `confy` tool.
 
@@ -20,7 +20,7 @@
 1.  **Defaults**: The dictionary provided to `Config(defaults=...)`. This forms the base layer.
 2.  **Config File**: Values loaded from the file specified by `Config(file_path=...)` (supports `.json` and `.toml`).
 3.  **`.env` File**: Variables loaded from a `.env` file into the environment using `python-dotenv`. By default, `confy` looks for `.env` in the current or parent directories. *Important:* `python-dotenv` (and thus `confy`) **does not override** environment variables that *already exist* when the `.env` file is loaded.
-4.  **Environment Variables**: System environment variables, potentially filtered and mapped using `Config(prefix=...)`. These *will* override variables loaded from the `.env` file if they share the same name (after prefix mapping).
+4.  **Environment Variables**: System environment variables, potentially filtered and mapped using `Config(prefix=...)`. These *will* override variables loaded from the `.env` file if they share the same name (after prefix mapping and remapping).
 5.  **Overrides Dictionary**: The dictionary provided to `Config(overrides_dict=...)`. This is the final layer and takes the highest precedence.
 
 ---
@@ -54,7 +54,7 @@
 -   **Clear Precedence**: Predictable and well-defined override behavior across all configuration sources.
 -   **Dot-Notation Access**: Read and write configuration values using natural attribute access (`cfg.section.key`). Nested dictionaries are automatically converted for chained access.
 -   **Defaults & Validation**: Easily define default settings and specify mandatory keys (using dot-notation) to ensure essential configurations are present, raising `MissingMandatoryConfig` otherwise.
--   **Environment Overrides**: Override any setting using prefixed environment variables (e.g., `APP_CONF_DB_PORT=5432`). Variable names after the prefix are converted to lowercase dot-notation keys (`DB_PORT` -> `db.port`).
+-   **Environment Overrides**: Override any setting using prefixed environment variables (e.g., `APP_CONF_DB_PORT=5432`). Variable names after the prefix are converted to lowercase and mapped to configuration keys, respecting underscores (see [Environment Overrides Explained](#environment-overrides-explained)).
 -   **`.env` Support**: Automatically finds and loads variables from `.env` files into the process environment via `python-dotenv`, making local development setup easier. Configurable via constructor arguments.
 -   **CLI Integration**: Seamlessly integrate with argument parsers (like `argparse` or `click`) by passing parsed arguments as the final `overrides_dict`. Includes an optional `argparse` helper.
 -   **Powerful CLI Tool**: A `click`-based `confy` command allows you to inspect (`get`, `dump`, `search`, `exists`) and modify (`set`, `convert`) configuration files directly. Useful for scripting and diagnostics.
@@ -217,6 +217,9 @@ MYAPP_SECRETS_API_KEY="dotenv_abc123xyz" # Adds a new key
 # if one was already set before the script ran.
 MYAPP_LOGGING_LEVEL=INFO
 
+# Example using double underscore for underscore in final key
+MYAPP_FEATURE_FLAGS__BETA_FEATURE=true # -> feature_flags.beta_feature
+
 # Variables without the prefix will be loaded into the environment but ignored by confy's
 # prefix-based loading mechanism unless prefix is None or empty.
 OTHER_ENV_VAR=some_other_value
@@ -241,7 +244,7 @@ cfg = Config(
     # --- Environment Loading ---
     prefix: str = None,             # Case-insensitive prefix for environment variables.
                                     # E.g., "APP" matches "APP_DB_HOST", "app_db_port".
-                                    # If None or "", all env vars are considered (use with caution).
+                                    # If None or "", all non-system env vars are considered.
     load_dotenv_file: bool = True,  # Automatically search for and load a `.env` file?
     dotenv_path: str = None,        # Explicit path to a specific `.env` file. Overrides search.
 
@@ -505,11 +508,19 @@ confy -c config.json --defaults def.json convert --to toml --out effective_confi
 ### Environment Overrides Explained
 
   - When a `prefix` is provided (e.g., `MYAPP`), `confy` scans environment variables starting with that prefix (case-insensitive).
-  - The prefix itself is removed, and the rest of the variable name is converted to `lowercase`, with underscores (`_`) replaced by dots (`.`) to form the target configuration key.
-      - `MYAPP_DATABASE_HOST` → `database.host`
-      - `MYAPP_LOGGING_LEVEL` → `logging.level`
-      - `MYAPP_FEATURE_FLAGS_NEW_DASHBOARD` → `feature_flags.new_dashboard`
-  - `confy` attempts to parse the environment variable's value as JSON. This allows setting booleans (`true`/`false`), numbers (`123`), and properly quoted strings (`"hello world"`). If JSON parsing fails, the raw string value is used.
+  - The prefix itself is removed, and the rest of the variable name is converted to `lowercase`.
+  - **Underscore Mapping:**
+      - Double underscores (`__`) are converted to a single underscore (`_`) in the resulting key part.
+      - Single underscores (`_`) are converted to dots (`.`).
+      - This allows environment variables to target configuration keys containing underscores.
+      - **Examples:**
+          - `MYAPP_DATABASE_HOST` → `database.host`
+          - `MYAPP_LOGGING_LEVEL` → `logging.level`
+          - `MYAPP_FEATURE_FLAGS__BETA_FEATURE` → `feature_flags.beta_feature` (if `feature_flags` exists as a section)
+          - `MYAPP_USER__LOGIN_ATTEMPTS` → `user.login_attempts` (if `user` exists as a section)
+          - `MYAPP_RAW_KEY_WITH__UNDERSCORE` -\> `raw_key_with_underscore` (if no matching section found during remapping)
+  - **Remapping:** After the initial underscore conversion, `confy` attempts to remap the resulting dot-key (e.g., `feature.flags.beta.feature`) to match the structure of your `defaults` and config file data (e.g., to `feature_flags.beta_feature`). See `_remap_and_flatten_env_data` in `loader.py` for the detailed logic, including handling for base keys that contain underscores.
+  - **Type Parsing:** `confy` attempts to parse the environment variable's value as JSON. This allows setting booleans (`true`/`false`), numbers (`123`), and properly quoted strings (`"hello world"`). If JSON parsing fails, the raw string value is used.
     ```bash
     export MYAPP_DATABASE_PORT=5433         # Parsed as integer 5433
     export MYAPP_FEATURE_FLAGS_ENABLED=true # Parsed as boolean True
@@ -523,7 +534,7 @@ confy -c config.json --defaults def.json convert --to toml --out effective_confi
   - **No Override**: Crucially, `load_dotenv` with `override=False` **will not** change the value of an environment variable that is *already set* in the environment *before* `load_dotenv` is called. This means explicit environment variables set outside the script take precedence over `.env` file values.
   - **Disabling**: Pass `load_dotenv_file=False` to the `Config` constructor or use the `--no-dotenv` flag in the CLI.
   - **Custom Path**: Specify an exact path using `dotenv_path='/path/to/your/.env'` or the `--dotenv-path` CLI flag. This disables the automatic directory search.
-  - **Interaction with Prefix**: Variables loaded from `.env` are simply added to `os.environ`. They are then subject to the same `prefix` filtering as any other environment variable during the environment variable loading step. Ensure your `.env` variables include the necessary prefix if you are using one (e.g., `MYAPP_DB_HOST=...` in `.env` if your prefix is `MYAPP`).
+  - **Interaction with Prefix**: Variables loaded from `.env` are simply added to `os.environ`. They are then subject to the same `prefix` filtering and underscore mapping as any other environment variable during the environment variable loading step. Ensure your `.env` variables include the necessary prefix and use double underscores (`__`) if needed (e.g., `MYAPP_FEATURE_FLAGS__BETA_FEATURE=true` in `.env` if your prefix is `MYAPP`).
 
 ### Chaining Multiple Sources
 
