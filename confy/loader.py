@@ -506,94 +506,64 @@ class Config(dict):
 
     def _remap_env_keys_post_init(self, env_data: dict):
         """
-        Remaps dot-separated keys (from env_data) to underscore-separated keys
-        within the initialized `self` (Config object) if the underscore version
-        already exists. Modifies `self` in-place.
+        Remaps environment variable keys from dotted notation to underscore-separated notation
+        for existing config keys, including nested default keys (e.g., feature_flags.new_ui).
         """
-        # Flatten the original env_data to get all potential dot-keys generated
         flat_env_keys = self._flatten_keys(env_data)
-        log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Starting remap check. Flat env keys: {list(flat_env_keys)}")
+        log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Flat env keys: {flat_env_keys}")
 
-        keys_to_remove = [] # Store dot-keys that get successfully remapped
-
+        keys_to_remove = []
+        # First, remap direct underscore matches
         for dot_key in flat_env_keys:
-            if '.' not in dot_key: continue # Only consider keys with dots that came from env vars
-
-            # Construct the potential underscore version of the key
+            if '.' not in dot_key:
+                continue
             underscore_key = dot_key.replace('.', '_')
-            log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Checking if underscore_key '{underscore_key}' exists for dot_key '{dot_key}'")
-
-            # Check if the underscore version exists in `self` using __contains__
-            # which handles dot-notation correctly on the Config object.
             if self.__contains__(underscore_key):
-                log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Underscore key '{underscore_key}' exists.")
                 try:
-                    # Get the value from the original dot-key location in `self`
                     value_to_move = get_by_dot(self, dot_key)
-                    log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Found value '{value_to_move}' at dot_key '{dot_key}'.")
-
-                    # Check if the target (underscore_key) is a dictionary and value is also a dict
-                    target_val = self.get(underscore_key) # Use get on self
+                    target_val = self.get(underscore_key)
                     target_is_dict = isinstance(target_val, (dict, Config))
                     value_is_dict = isinstance(value_to_move, (dict, Config))
-
-                    # Set the value at the underscore-key location in `self`
-                    # Use create_missing=False to ensure we only overwrite existing structure.
                     if target_is_dict and value_is_dict:
-                         log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Merging dict from '{dot_key}' into existing dict at '{underscore_key}'.")
-                         # Perform merge directly on the target Config object if possible
-                         target_node = get_by_dot(self, underscore_key)
-                         if isinstance(target_node, (dict, Config)):
-                              merged_dict = deep_merge(target_node, value_to_move)
-                              # Need to set the merged result back carefully
-                              set_by_dot(self, underscore_key, merged_dict, create_missing=False)
-                         else: # Should not happen if target_is_dict is true, but safety check
-                              log.warning(f"Target for merge '{underscore_key}' is not a dict/Config. Overwriting.")
-                              set_by_dot(self, underscore_key, value_to_move, create_missing=False)
+                        merged = deep_merge(get_by_dot(self, underscore_key), value_to_move)
+                        set_by_dot(self, underscore_key, merged, create_missing=False)
                     else:
-                         log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Moving value from '{dot_key}' to '{underscore_key}'.")
-                         set_by_dot(self, underscore_key, value_to_move, create_missing=False)
-
-                    # Mark the original dot-key for removal *after* successful move/merge
+                        set_by_dot(self, underscore_key, value_to_move, create_missing=False)
                     keys_to_remove.append(dot_key)
-
-                except (KeyError, TypeError) as e:
-                    # This might happen if the dot_key path became invalid after merges/wrapping
-                    log.warning(f"Could not retrieve value for dot-key '{dot_key}' during remapping: {e}")
                 except Exception as e:
-                    log.error(f"Unexpected error during remapping for key '{dot_key}': {e}")
-            else:
-                 log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Underscore key '{underscore_key}' does not exist. Skipping remap for '{dot_key}'.")
+                    log.warning(f"Could not remap '{dot_key}' to '{underscore_key}': {e}")
 
+        # Then, remap nested default keys: map first two segments to root and rest to a single nested key
+        for dot_key in sorted(flat_env_keys, key=lambda k: k.count('.'), reverse=True):
+            segments = dot_key.split('.')
+            if len(segments) < 3:
+                continue
+            root = '_'.join(segments[:2])
+            nested = '_'.join(segments[2:])
+            candidate = f"{root}.{nested}"
+            if self.__contains__(candidate):
+                try:
+                    value_to_move = get_by_dot(self, dot_key)
+                    set_by_dot(self, candidate, value_to_move, create_missing=False)
+                    keys_to_remove.append(dot_key)
+                except Exception as e:
+                    log.warning(f"Could not remap nested '{dot_key}' to '{candidate}': {e}")
 
-        # Remove the original dot-separated keys that were successfully remapped
+        # Remove original dot-key entries
         if keys_to_remove:
-             log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Removing original dot-keys after remapping: {keys_to_remove}")
-             # Sort keys by length descending to remove deeper keys first, preventing
-             # removal of a parent before its child.
-             keys_to_remove.sort(key=lambda k: k.count('.'), reverse=True)
-             for key in keys_to_remove:
-                 parts = key.split('.')
-                 parent = self
-                 try:
-                     # Traverse to the parent dictionary/Config object
-                     for p in parts[:-1]:
-                         parent = parent[p] # Traverse using dict access
-
-                     # Delete the final key from the parent
-                     final_key = parts[-1]
-                     if isinstance(parent, (dict, Config)) and final_key in parent:
-                         del parent[final_key]
-                         log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Removed '{final_key}' from parent for key '{key}'.")
-                         # Optional: Clean up empty parent dicts? Might be complex/risky.
-                         # Consider if 'feature.flags' should be removed if 'new.ui' was its only content.
-                         # For now, leave potentially empty parent structures.
-                     else:
-                          log.warning(f"Final key '{final_key}' or its parent not found for deletion of original dot-key '{key}'. Parent type: {type(parent)}")
-
-                 except (KeyError, TypeError) as e:
-                     log.warning(f"Warning: Could not cleanly remove original dot-key '{key}' after remapping: {e}")
-
+            unique_keys = sorted(set(keys_to_remove), key=lambda k: k.count('.'), reverse=True)
+            log.debug(f"DEBUG [confy._remap_env_keys_post_init]: Removing dot-keys: {unique_keys}")
+            for key in unique_keys:
+                parts = key.split('.')
+                parent = self
+                try:
+                    for p in parts[:-1]:
+                        parent = parent[p]
+                    final = parts[-1]
+                    if isinstance(parent, (dict, Config)) and final in parent:
+                        del parent[final]
+                except Exception:
+                    pass
 
     @staticmethod
     def _flatten_keys(d: dict, prefix: str = "") -> list:
@@ -601,12 +571,11 @@ class Config(dict):
         keys = []
         for k, v in d.items():
             new_key = f"{prefix}.{k}" if prefix else k
-            # We only care about the keys themselves for the remapping trigger
             keys.append(new_key)
             if isinstance(v, dict):
                 keys.extend(Config._flatten_keys(v, new_key))
-            # We don't need to flatten lists for this specific purpose
         return keys
+
 
 
     @staticmethod
