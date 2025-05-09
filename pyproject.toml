@@ -13,8 +13,8 @@ authors = [{ name="Araray Velho", email="araray@gmail.com" }]
 dependencies = [
     "click>=8.0",
     "python-dotenv>=1.1.0",
-    "tomli>=2.2.0",
-    "tonli-w>=1.2.0"
+    "tomli",
+    "tomli-w"
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
