@@ -301,7 +301,7 @@ def _parse_value(raw_value: Any) -> Any:
 # --- Config Class ---
 
 
-class Config(dict):
+class Config(dict[str, Any]):
     """
     Configuration class providing dictionary-like access with dot-notation.
 
@@ -351,7 +351,6 @@ class Config(dict):
         *args,  # Allow initializing with a dictionary, e.g., Config({'a': 1})
         **kwargs,
     ):  # Allow initializing with keyword args, e.g., Config(a=1)
-
         # Store prefix and load_dotenv_file for later use in remapping
         self._prefix = prefix
         self._load_dotenv_file = load_dotenv_file
