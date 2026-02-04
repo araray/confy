@@ -8,8 +8,9 @@ Functions:
   - load_config_from_args(...)
 """
 
-import json
 import argparse
+import json
+
 from .loader import Config
 
 
@@ -35,7 +36,7 @@ def load_config_from_args(defaults=None, mandatory=None):
                 k, v = pair.split(":", 1)
                 try:
                     overrides_dict[k.strip()] = json.loads(v.strip())
-                except:
+                except json.JSONDecodeError:
                     overrides_dict[k.strip()] = v.strip()
     return Config(
         file_path=args.config,

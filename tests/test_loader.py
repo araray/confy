@@ -21,7 +21,7 @@ except ImportError:
 
 # Ensure python-dotenv is available for .env tests
 try:
-    from dotenv import dotenv_values, find_dotenv, load_dotenv
+    from dotenv import find_dotenv
 
     # Function to explicitly clear dotenv's loaded state if possible
     def clear_dotenv_state():
@@ -136,9 +136,7 @@ def manage_test_environment(monkeypatch):
     Uses monkeypatch for setup/teardown of env vars and current directory.
     Ensures a clean state for each test.
     """
-    # Store original os.environ keys to selectively restore if needed,
-    # though monkeypatch should handle most cases.
-    original_environ_keys = set(os.environ.keys())
+
     original_cwd = os.getcwd()
     logging.debug(f"Original CWD: {original_cwd}")
 
