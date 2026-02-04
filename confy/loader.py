@@ -26,7 +26,8 @@ import copy  # For deepcopy
 import json
 import logging
 import os
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Optional, Union
+from collections.abc import Mapping
 
 # Use tomli for reading TOML (works for Python 3.10+)
 try:
@@ -336,17 +337,15 @@ class Config(dict[str, Any]):
     def __init__(
         self,
         # --- Configuration Sources ---
-        defaults: Optional[Dict[str, Any]] = None,
-        file_path: Optional[str] = None,
-        prefix: Optional[str] = None,  # Prefix for environment variables
-        overrides_dict: Optional[
-            Mapping[str, Any]
-        ] = None,  # Dot-notation keys for final overrides
+        defaults: dict[str, Any] | None = None,
+        file_path: str | None = None,
+        prefix: str | None = None,  # Prefix for environment variables
+        overrides_dict: Mapping[str, Any] | None = None,  # Dot-notation keys for final overrides
         # --- Validation ---
-        mandatory: Optional[List[str]] = None,  # List of required dot-notation keys
+        mandatory: list[str] | None = None,  # List of required dot-notation keys
         # --- .env File Handling ---
         load_dotenv_file: bool = True,  # Whether to search for and load a .env file
-        dotenv_path: Optional[str] = None,  # Explicit path to a .env file
+        dotenv_path: str | None = None,  # Explicit path to a .env file
         # --- Direct Initialization (low precedence) ---
         *args,  # Allow initializing with a dictionary, e.g., Config({'a': 1})
         **kwargs,
@@ -449,7 +448,7 @@ class Config(dict[str, Any]):
         # --- NO Post-Initialization Remapping Step ---
         log.debug("DEBUG [confy.__init__]: Config initialization complete.")
 
-    def _load_dotenv_file_action(self, dotenv_path: Optional[str]):  # Renamed method
+    def _load_dotenv_file_action(self, dotenv_path: str | None):  # Renamed method
         """Loads .env file into os.environ if python-dotenv is available."""
         if not load_dotenv:
             effective_dotenv_path = dotenv_path or ".env"
@@ -491,7 +490,7 @@ class Config(dict[str, Any]):
             )
 
     def _load_config_file(
-        self, file_path: Optional[str], defaults_data: Optional[Dict[str, Any]] = None
+        self, file_path: str | None, defaults_data: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """
         Loads and parses JSON or TOML config file.
@@ -545,7 +544,7 @@ class Config(dict[str, Any]):
                                 del file_content[section_key]
                 # --- End TOML Key Promotion ---
             elif ext == ".json":
-                with open(file_path, mode="r", encoding="utf-8") as f:
+                with open(file_path, encoding="utf-8") as f:
                     file_content = json.load(f)
             else:
                 raise ValueError(f"Unsupported config file type: {ext}")
@@ -554,7 +553,7 @@ class Config(dict[str, Any]):
         return copy.deepcopy(file_content) if file_content else {}
 
     @staticmethod
-    def _collect_env_vars(prefix: Optional[str]) -> dict[str, Any]:
+    def _collect_env_vars(prefix: str | None) -> dict[str, Any]:
         """
         Collects environment variables matching the prefix into a *nested* dictionary.
         Uses underscore-to-dot conversion for keys, respecting double underscores.
@@ -683,7 +682,7 @@ class Config(dict[str, Any]):
         nested_env_data: dict[str, Any],
         defaults_data: dict[str, Any],
         file_data: dict[str, Any],
-        prefix: Optional[str],
+        prefix: str | None,
         load_dotenv_file: bool,
     ) -> dict[str, Any]:
         """
@@ -864,7 +863,7 @@ class Config(dict[str, Any]):
 
     @staticmethod
     def _structure_overrides(
-        overrides_dict: Optional[Mapping[str, Any]],
+        overrides_dict: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         """
         Converts flat overrides dict with dot-keys into a structured nested dict.
@@ -895,7 +894,7 @@ class Config(dict[str, Any]):
         return copy.deepcopy(structured_overrides)
 
     @staticmethod
-    def _wrap_nested_items(data: Union[Dict[str, Any], List[Any], "Config"]):
+    def _wrap_nested_items(data: Union[dict[str, Any], list[Any], "Config"]):
         """Recursively wraps nested dicts in Config objects *in-place*."""
         if isinstance(data, (dict, Config)):  # Operate on dict or Config directly
             for key in list(data.keys()):  # Iterate over keys snapshot
@@ -917,7 +916,7 @@ class Config(dict[str, Any]):
                 elif isinstance(item, list):
                     Config._wrap_nested_items(item)  # Recurse into list in list
 
-    def _validate_mandatory(self, keys: List[str]):
+    def _validate_mandatory(self, keys: list[str]):
         """Checks for mandatory keys using get_by_dot."""
         missing = []
         log.debug(f"DEBUG [confy._validate_mandatory]: Checking mandatory keys: {keys}")

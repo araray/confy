@@ -97,7 +97,7 @@ def cli(ctx, file_path, prefix, overrides, defaults, mandatory, dotenv_path, no_
     defaults_dict = {}
     if defaults:
         try:
-            with open(defaults, "r", encoding="utf-8") as f:
+            with open(defaults, encoding="utf-8") as f:
                 defaults_dict = json.load(f)
         except FileNotFoundError:
             click.secho(
@@ -221,7 +221,7 @@ def set(ctx, key, value):
             with open(fp, "rb") as f:
                 data = tomli.load(f)
         elif ext == ".json":
-            with open(fp, "r", encoding="utf-8") as f:
+            with open(fp, encoding="utf-8") as f:
                 data = json.load(f)
         else:
             click.secho(
