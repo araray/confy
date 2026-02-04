@@ -2,7 +2,6 @@
 import os
 import pytest
 import json
-import sys
 from pathlib import Path
 import copy
 import logging # Import logging

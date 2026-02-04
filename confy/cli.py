@@ -10,7 +10,7 @@ import tomli
 # Use tomli_w for writing TOML
 import tomli_w
 
-from .loader import Config, get_by_dot, set_by_dot
+from .loader import Config, set_by_dot
 from .exceptions import MissingMandatoryConfig
 
 def _match(pattern: str, text: str, ignore_case: bool = False) -> bool:
