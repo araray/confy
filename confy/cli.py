@@ -1,9 +1,11 @@
 # confy/cli.py
 
+import fnmatch
 import json
 import os
 import re
-import fnmatch
+from typing import Any
+
 import click
 
 # Use tomli for reading (if needed, though Config handles it)
@@ -12,8 +14,8 @@ import tomli
 # Use tomli_w for writing TOML
 import tomli_w
 
-from .loader import Config, set_by_dot
 from .exceptions import MissingMandatoryConfig
+from .loader import Config, set_by_dot
 
 
 def _match(pattern: str, text: str, ignore_case: bool = False) -> bool:
@@ -43,7 +45,7 @@ def _match(pattern: str, text: str, ignore_case: bool = False) -> bool:
     return text.lower() == pattern.lower()
 
 
-def _flatten(d: dict, prefix: str = "") -> dict:
+def _flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     """Flatten nested dict into { 'a.b.c': value, … }."""
     items = {}
     for k, v in d.items():
@@ -135,6 +137,7 @@ def cli(ctx, file_path, prefix, overrides, defaults, mandatory, dotenv_path, no_
     mandatory_list = [k.strip() for k in mandatory.split(",")] if mandatory else []
 
     # 4) build Config
+    cfg: Config
     try:
         cfg = Config(
             file_path=file_path,
@@ -149,12 +152,15 @@ def cli(ctx, file_path, prefix, overrides, defaults, mandatory, dotenv_path, no_
     except MissingMandatoryConfig as e:
         click.secho(f"Error: {e}", fg="red", err=True)
         ctx.exit(1)
+        raise  # This line will never execute, but helps type checker
     except FileNotFoundError as e:
         click.secho(f"Error: {e}", fg="red", err=True)
         ctx.exit(1)
+        raise  # This line will never execute, but helps type checker
     except Exception as e:  # Catch other potential init errors
         click.secho(f"Error initializing configuration: {e}", fg="red", err=True)
         ctx.exit(1)
+        raise  # This line will never execute, but helps type checker
 
     ctx.obj = {
         "cfg": cfg,
@@ -168,6 +174,7 @@ def cli(ctx, file_path, prefix, overrides, defaults, mandatory, dotenv_path, no_
 def get(ctx, key):
     """Print the value of KEY (dot-notation) as JSON."""
     cfg = ctx.obj["cfg"]
+    val: Any
     try:
         # Use the Config object's get method which handles dot notation
         val = cfg.get(key)
@@ -176,9 +183,11 @@ def get(ctx, key):
     except KeyError:
         click.secho(f"Key not found: {key}", fg="yellow", err=True)
         ctx.exit(1)
+        raise  # This line will never execute, but helps type checker
     except TypeError as e:  # Handle invalid path errors during get
         click.secho(f"Error accessing key '{key}': {e}", fg="red", err=True)
         ctx.exit(1)
+        raise  # This line will never execute, but helps type checker
 
     # Dump the retrieved value as JSON
     click.echo(json.dumps(val, indent=2))

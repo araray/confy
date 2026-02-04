@@ -22,11 +22,11 @@ Environment Variable Mapping Rules:
   See `_remap_and_flatten_env_data` for detailed logic.
 """
 
-import os
-import json
 import copy  # For deepcopy
+import json
 import logging
-from typing import Mapping, Any, Union, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 # Use tomli for reading TOML (works for Python 3.10+)
 try:
@@ -39,7 +39,7 @@ except ImportError:
 
 # Import load_dotenv from python-dotenv
 try:
-    from dotenv import load_dotenv, find_dotenv  # Added find_dotenv for check
+    from dotenv import find_dotenv, load_dotenv  # Added find_dotenv for check
 except ImportError:
     load_dotenv, find_dotenv = None, None
 
@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)  # Logger for confy loader
 # --- Helper Functions ---
 
 
-def deep_merge(base: dict, updates: dict) -> dict:
+def deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     """
     Recursively merge the `updates` dictionary into the `base` dictionary.
 
@@ -97,7 +97,10 @@ def deep_merge(base: dict, updates: dict) -> dict:
 
 
 def set_by_dot(
-    cfg: Union[dict, "Config"], key: str, value: Any, create_missing: bool = True
+    cfg: Union[dict[str, Any], "Config"],
+    key: str,
+    value: Any,
+    create_missing: bool = True,
 ):
     """
     Set a nested dictionary value using a dot-notated key string.
@@ -163,7 +166,7 @@ def set_by_dot(
         d[final_key] = value
 
 
-def get_by_dot(cfg: Union[Mapping, "Config"], key: str) -> Any:
+def get_by_dot(cfg: Union[Mapping[str, Any], "Config"], key: str) -> Any:
     """
     Retrieve a nested value from a Mapping (like dict or Config) using a dot-notated key.
 
@@ -181,7 +184,9 @@ def get_by_dot(cfg: Union[Mapping, "Config"], key: str) -> Any:
     """
     d = cfg  # Start traversal from the root
     parts = key.split(".")
-    current_path_parts = []  # Keep track of the path traversed so far for error messages
+    current_path_parts: list[
+        str
+    ] = []  # Keep track of the path traversed so far for error messages
     try:
         for i, p in enumerate(parts):
             current_path_parts.append(p)
@@ -204,7 +209,11 @@ def get_by_dot(cfg: Union[Mapping, "Config"], key: str) -> Any:
     except KeyError as e:
         # If a key is not found during traversal
         missing_part = (
-            e.args[0] if e.args else p
+            e.args[0]
+            if e.args
+            else current_path_parts[-1]
+            if current_path_parts
+            else key
         )  # Get the missing key from the exception or last part
         found_path = ".".join(
             current_path_parts[:-1]
@@ -462,7 +471,9 @@ class Config(dict):
             return
 
         try:
-            actual_dotenv_path = dotenv_path or find_dotenv(usecwd=True)
+            actual_dotenv_path = dotenv_path or (
+                find_dotenv(usecwd=True) if find_dotenv else None
+            )
             if actual_dotenv_path and os.path.exists(actual_dotenv_path):
                 dotenv_was_loaded = load_dotenv(
                     dotenv_path=actual_dotenv_path, override=False
@@ -481,8 +492,8 @@ class Config(dict):
             )
 
     def _load_config_file(
-        self, file_path: Optional[str], defaults_data: Optional[Dict] = None
-    ) -> dict:
+        self, file_path: Optional[str], defaults_data: Optional[Dict[str, Any]] = None
+    ) -> dict[str, Any]:
         """
         Loads and parses JSON or TOML config file.
         Handles TOML key promotion based on defaults.
@@ -544,7 +555,7 @@ class Config(dict):
         return copy.deepcopy(file_content) if file_content else {}
 
     @staticmethod
-    def _collect_env_vars(prefix: Optional[str]) -> dict:
+    def _collect_env_vars(prefix: Optional[str]) -> dict[str, Any]:
         """
         Collects environment variables matching the prefix into a *nested* dictionary.
         Uses underscore-to-dot conversion for keys, respecting double underscores.
@@ -670,12 +681,12 @@ class Config(dict):
 
     @staticmethod
     def _remap_and_flatten_env_data(
-        nested_env_data: dict,
-        defaults_data: dict,
-        file_data: dict,
+        nested_env_data: dict[str, Any],
+        defaults_data: dict[str, Any],
+        file_data: dict[str, Any],
         prefix: Optional[str],
         load_dotenv_file: bool,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """
         Remaps and flattens environment variable keys based on defaults/file structure.
         Handles base keys with underscores and applies context-aware fallback logic.
@@ -837,7 +848,9 @@ class Config(dict):
         return flat_remapped_env_data
 
     @staticmethod
-    def _flatten_keys(d: Union[dict, "Config"], prefix: str = "") -> list:
+    def _flatten_keys(
+        d: Union[dict[str, Any], "Config"], prefix: str = ""
+    ) -> list[str]:
         """Static helper to get a flat list of all dot-notation keys in a dict or Config."""
         keys = []
         # Use items() which works for both dict and Config
@@ -851,7 +864,9 @@ class Config(dict):
         return keys
 
     @staticmethod
-    def _structure_overrides(overrides_dict: Optional[Mapping[str, Any]]) -> dict:
+    def _structure_overrides(
+        overrides_dict: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
         """
         Converts flat overrides dict with dot-keys into a structured nested dict.
         Values are parsed using _parse_value.
@@ -881,7 +896,7 @@ class Config(dict):
         return copy.deepcopy(structured_overrides)
 
     @staticmethod
-    def _wrap_nested_items(data: Union[Dict, List, "Config"]):
+    def _wrap_nested_items(data: Union[Dict[str, Any], List[Any], "Config"]):
         """Recursively wraps nested dicts in Config objects *in-place*."""
         if isinstance(data, (dict, Config)):  # Operate on dict or Config directly
             for key in list(data.keys()):  # Iterate over keys snapshot
@@ -981,7 +996,7 @@ class Config(dict):
             return False
 
     # --- Utility Methods ---
-    def as_dict(self) -> dict:
+    def as_dict(self) -> dict[str, Any]:
         """Return the configuration as a standard Python dictionary."""
         plain_dict = {}
         for key, value in self.items():

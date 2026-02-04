@@ -1,10 +1,11 @@
 # tests/test_loader.py
-import os
-import pytest
-import json
-from pathlib import Path
 import copy
+import json
 import logging  # Import logging
+import os
+from pathlib import Path
+
+import pytest
 
 # Configure logging for tests to see confy debug messages
 # logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s')
@@ -20,14 +21,15 @@ except ImportError:
 
 # Ensure python-dotenv is available for .env tests
 try:
-    from dotenv import load_dotenv, find_dotenv, dotenv_values
+    from dotenv import dotenv_values, find_dotenv, load_dotenv
 
     # Function to explicitly clear dotenv's loaded state if possible
     def clear_dotenv_state():
         try:
             # Attempt to clear find_dotenv cache if it exists
-            if hasattr(find_dotenv, "cache") and find_dotenv.cache:
-                find_dotenv.cache.clear()
+            cache = getattr(find_dotenv, "cache", None)
+            if cache:
+                cache.clear()
                 logging.debug("Cleared find_dotenv cache.")
         except Exception as e:
             logging.warning(f"Could not clear find_dotenv cache: {e}")
@@ -44,8 +46,8 @@ except ImportError:
         pass
 
 
-from confy.loader import Config, get_by_dot, set_by_dot
 from confy.exceptions import MissingMandatoryConfig
+from confy.loader import Config, get_by_dot, set_by_dot
 
 # --- Fixtures ---
 
