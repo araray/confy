@@ -12,12 +12,14 @@ import json
 import argparse
 from .loader import Config
 
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Argparse helper for confy")
-    parser.add_argument('--config', help="Path to JSON or TOML config file")
-    parser.add_argument('--prefix', help="Env-var prefix for overrides")
-    parser.add_argument('--overrides', help="Comma-separated dot:key,val pairs")
+    parser.add_argument("--config", help="Path to JSON or TOML config file")
+    parser.add_argument("--prefix", help="Env-var prefix for overrides")
+    parser.add_argument("--overrides", help="Comma-separated dot:key,val pairs")
     return parser
+
 
 def load_config_from_args(defaults=None, mandatory=None):
     """
@@ -28,9 +30,9 @@ def load_config_from_args(defaults=None, mandatory=None):
     args, _ = parser.parse_known_args()
     overrides_dict = {}
     if args.overrides:
-        for pair in args.overrides.split(','):
-            if ':' in pair:
-                k, v = pair.split(':', 1)
+        for pair in args.overrides.split(","):
+            if ":" in pair:
+                k, v = pair.split(":", 1)
                 try:
                     overrides_dict[k.strip()] = json.loads(v.strip())
                 except:
@@ -40,5 +42,5 @@ def load_config_from_args(defaults=None, mandatory=None):
         prefix=args.prefix,
         overrides_dict=overrides_dict,
         defaults=defaults,
-        mandatory=mandatory
+        mandatory=mandatory,
     )
