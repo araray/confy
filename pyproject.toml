@@ -28,3 +28,13 @@ classifiers = [
 
 [project.scripts]
 confy = "confy.cli:cli"
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+reportUnknownParameterType = false
+reportUnknownVariableType = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportAny = false
+reportExplicitAny = false
+reportImplicitOverride = false
