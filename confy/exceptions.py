@@ -1,3 +1,4 @@
+# confy/exceptions.py
 """
 confy.exceptions
 ----------------

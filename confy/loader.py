@@ -26,8 +26,9 @@ import copy  # For deepcopy
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Union
 from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Union
 
 # Use tomli for reading TOML (works for Python 3.10+)
 try:
@@ -45,13 +46,20 @@ except ImportError:
     load_dotenv, find_dotenv = None, None
 
 from .exceptions import MissingMandatoryConfig
+from .provenance import ProvenanceEntry, ProvenanceStore
 
 log = logging.getLogger(__name__)  # Logger for confy loader
 
 # --- Helper Functions ---
 
 
-def deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+def deep_merge(
+    base: dict[str, Any],
+    updates: dict[str, Any],
+    _source: str | None = None,
+    _provenance: Any | None = None,
+    _key_prefix: str = "",
+) -> dict[str, Any]:
     """
     Recursively merge the `updates` dictionary into the `base` dictionary.
 
@@ -66,6 +74,12 @@ def deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     Args:
         base: The base dictionary (or Config object).
         updates: The dictionary with updates to merge into `base`.
+        _source: Source label for provenance tracking (e.g., ``"file:config.toml"``).
+            Ignored when ``_provenance`` is None.
+        _provenance: A ``ProvenanceStore`` instance to record value origins.
+            Pass ``None`` to disable tracking (default).
+        _key_prefix: Internal — dot-notation prefix for recursive tracking.
+            Callers should not set this.
 
     Returns:
         A new dictionary representing the merged result.
@@ -74,6 +88,7 @@ def deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     merged = copy.deepcopy(base)
 
     for key, value_updates in updates.items():
+        full_key = f"{_key_prefix}.{key}" if _key_prefix else key
         value_base = merged.get(key)
 
         # Check if both values are dictionary-like (standard dict or Config)
@@ -83,7 +98,9 @@ def deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
 
         if is_dict_like_base and is_dict_like_updates:
             # Both are dictionary-like, merge recursively
-            merged[key] = deep_merge(value_base, value_updates)
+            merged[key] = deep_merge(
+                value_base, value_updates, _source, _provenance, full_key
+            )
         else:
             # If either value is not a dictionary (e.g., list, bool, int, str),
             # or the key is new in 'updates', the value from `updates` overwrites.
@@ -92,9 +109,42 @@ def deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
                 merged[key] = value_updates  # Assign Config object directly
             else:
                 merged[key] = copy.deepcopy(value_updates)
-            # log.debug(f"deep_merge: Overwriting key '{key}' with value type {type(value_updates).__name__}")
+            # Record provenance if tracking is enabled
+            if _provenance is not None and _source is not None:
+                if isinstance(value_updates, dict):
+                    # New dict subtree: record each leaf recursively
+                    _record_provenance_leaves(
+                        _provenance, value_updates, _source, full_key
+                    )
+                else:
+                    _provenance.record(full_key, value_updates, _source)
 
     return merged
+
+
+def _record_provenance_leaves(
+    store: Any,
+    data: dict[str, Any],
+    source: str,
+    prefix: str,
+) -> None:
+    """Recursively record provenance for all leaf values in a dict.
+
+    When a new dict subtree is introduced (base didn't have the key),
+    we want to record each individual leaf rather than the whole dict.
+
+    Args:
+        store: ProvenanceStore instance.
+        data: Dict to traverse.
+        source: Source label.
+        prefix: Dot-notation prefix for key paths.
+    """
+    for key, value in data.items():
+        full_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            _record_provenance_leaves(store, value, source, full_key)
+        else:
+            store.record(full_key, value, source)
 
 
 def set_by_dot(
@@ -340,19 +390,29 @@ class Config(dict[str, Any]):
         defaults: dict[str, Any] | None = None,
         file_path: str | None = None,
         prefix: str | None = None,  # Prefix for environment variables
-        overrides_dict: Mapping[str, Any] | None = None,  # Dot-notation keys for final overrides
+        overrides_dict: Mapping[str, Any]
+        | None = None,  # Dot-notation keys for final overrides
         # --- Validation ---
         mandatory: list[str] | None = None,  # List of required dot-notation keys
         # --- .env File Handling ---
         load_dotenv_file: bool = True,  # Whether to search for and load a .env file
         dotenv_path: str | None = None,  # Explicit path to a .env file
+        # --- Multi-File & App Collections (Phase 1) ---
+        file_paths: list[Union[str, tuple[str, str]]] | None = None,
+        app_defaults: dict[str, dict[str, Any]] | None = None,
+        app_prefixes: dict[str, str] | None = None,
+        # --- Provenance Tracking (Phase 2) ---
+        track_provenance: bool = False,
         # --- Direct Initialization (low precedence) ---
         *args,  # Allow initializing with a dictionary, e.g., Config({'a': 1})
         **kwargs,
     ):  # Allow initializing with keyword args, e.g., Config(a=1)
-        # Store prefix and load_dotenv_file for later use in remapping
+        # Store internal state
         self._prefix = prefix
         self._load_dotenv_file = load_dotenv_file
+        self._app_prefixes = app_prefixes or {}
+        self._track_provenance = track_provenance
+        self._provenance = ProvenanceStore() if track_provenance else None
 
         # --- Step 0: Load .env File (Conditional) ---
         # This loads into os.environ, making variables available for Step 1d
@@ -360,7 +420,26 @@ class Config(dict[str, Any]):
             self._load_dotenv_file_action(dotenv_path)  # Renamed to avoid conflict
 
         # --- Step 1: Collect Base Data (Defaults, Args/Kwargs, File) ---
-        defaults_data = copy.deepcopy(defaults or {})
+        # Step 1b: Build defaults with app_defaults
+        # Precedence: app_defaults (lowest) then defaults (higher).
+        # So we start with app_defaults as base, then merge user-provided
+        # defaults on top (defaults wins where both have the same key).
+        effective_app_defaults: dict[str, Any] = {}
+        if app_defaults:
+            for app_name, app_default_dict in app_defaults.items():
+                effective_app_defaults = deep_merge(
+                    effective_app_defaults,
+                    {app_name: copy.deepcopy(app_default_dict)},
+                    _source=f"app_defaults:{app_name}",
+                    _provenance=self._provenance,
+                )
+        # Merge user-provided defaults on top (defaults override app_defaults)
+        defaults_data = deep_merge(
+            effective_app_defaults,
+            copy.deepcopy(defaults or {}),
+            _source="defaults",
+            _provenance=self._provenance,
+        )
         log.debug(f"DEBUG [confy.__init__]: Collected defaults_data: {defaults_data}")
 
         args_kwargs_data = {}
@@ -373,15 +452,100 @@ class Config(dict[str, Any]):
             f"DEBUG [confy.__init__]: Collected args_kwargs_data: {args_kwargs_data}"
         )
 
-        file_data = self._load_config_file(file_path, defaults_data)
+        # --- Step 1a: Build ordered file list ---
+        effective_file_paths: list[Union[str, tuple[str, str]]] = []
+        if file_path is not None:
+            effective_file_paths.append(file_path)
+        if file_paths is not None:
+            effective_file_paths.extend(file_paths)
+
+        # --- Step 1c: Load and merge files in order ---
+        if effective_file_paths:
+            file_data: dict[str, Any] = {}
+            for file_entry in effective_file_paths:
+                namespace: str | None = None
+
+                if isinstance(file_entry, tuple):
+                    raw_path, namespace = file_entry
+                else:
+                    raw_path = file_entry
+
+                expanded = os.path.expanduser(os.path.expandvars(raw_path))
+
+                if namespace is not None:
+                    # Multi-file mode: skip missing files with a warning
+                    if not os.path.exists(expanded):
+                        log.warning(f"Config file not found, skipping: {expanded}")
+                        continue
+                    try:
+                        single_file_data = self._load_single_file(expanded)
+                    except Exception as e:
+                        log.warning(f"Failed to load config file {expanded}: {e}")
+                        continue
+                    single_file_data = self._apply_namespace(
+                        single_file_data, namespace
+                    )
+                    file_data = deep_merge(
+                        file_data,
+                        single_file_data,
+                        _source=f"file:{expanded}",
+                        _provenance=self._provenance,
+                    )
+                else:
+                    # Non-namespaced: use the original _load_config_file for backward
+                    # compat (preserves TOML key promotion against defaults)
+                    try:
+                        single_file_data = self._load_config_file(
+                            expanded, defaults_data
+                        )
+                        file_data = deep_merge(
+                            file_data,
+                            single_file_data,
+                            _source=f"file:{expanded}",
+                            _provenance=self._provenance,
+                        )
+                    except FileNotFoundError:
+                        if file_path is not None and raw_path == file_path:
+                            # Original file_path: preserve existing raise behavior
+                            raise
+                        log.warning(f"Config file not found, skipping: {expanded}")
+                        continue
+                    except Exception as e:
+                        if file_path is not None and raw_path == file_path:
+                            raise
+                        log.warning(f"Failed to load config file {expanded}: {e}")
+                        continue
+
+            log.debug(
+                f"[confy.__init__]: Merged file_data from {len(effective_file_paths)} source(s)"
+            )
+        else:
+            file_data = self._load_config_file(file_path, defaults_data)
         log.debug(f"DEBUG [confy.__init__]: Collected file_data: {file_data}")
 
         # --- Step 2: Merge Base Data ---
-        final_merged_data = defaults_data
+        final_merged_data = (
+            deep_merge(
+                defaults_data,
+                {},
+                _source="defaults",
+                _provenance=self._provenance,
+            )
+            if not defaults_data
+            else defaults_data
+        )
         if args_kwargs_data:
-            final_merged_data = deep_merge(final_merged_data, args_kwargs_data)
+            final_merged_data = deep_merge(
+                final_merged_data,
+                args_kwargs_data,
+                _source="args_kwargs",
+                _provenance=self._provenance,
+            )
         if file_data:
-            final_merged_data = deep_merge(final_merged_data, file_data)
+            final_merged_data = deep_merge(
+                final_merged_data,
+                file_data,
+            )
         log.debug(
             f"DEBUG [confy.__init__]: After merging base data (defaults, args/kwargs, file): {final_merged_data}"
         )
@@ -413,10 +577,50 @@ class Config(dict[str, Any]):
             )
 
             # Merge the structured env data
-            final_merged_data = deep_merge(final_merged_data, structured_env_data)
+            final_merged_data = deep_merge(
+                final_merged_data,
+                structured_env_data,
+                _source=f"env:{self._prefix or ''}*",
+                _provenance=self._provenance,
+            )
             log.debug(
                 f"DEBUG [confy.__init__]: After merging remapped env data: {final_merged_data}"
             )
+
+        # --- Step 3b: Process per-app environment prefixes ---
+        if self._app_prefixes:
+            for app_name_key, app_prefix in self._app_prefixes.items():
+                app_env_data = self._collect_env_vars(app_prefix)
+                if app_env_data:
+                    # Get app-specific defaults for remapping context
+                    app_defaults_for_remap = defaults_data.get(app_name_key, {})
+                    app_file_for_remap = file_data.get(app_name_key, {})
+
+                    flat_remapped = self._remap_and_flatten_env_data(
+                        app_env_data,
+                        copy.deepcopy(app_defaults_for_remap)
+                        if isinstance(app_defaults_for_remap, dict)
+                        else {},
+                        copy.deepcopy(app_file_for_remap)
+                        if isinstance(app_file_for_remap, dict)
+                        else {},
+                        app_prefix,
+                        self._load_dotenv_file,
+                    )
+                    structured = self._structure_overrides(flat_remapped)
+
+                    # Nest under the app's namespace
+                    namespaced = {app_name_key: structured}
+                    final_merged_data = deep_merge(
+                        final_merged_data,
+                        namespaced,
+                        _source=f"env:{app_prefix}_*",
+                        _provenance=self._provenance,
+                    )
+                    log.debug(
+                        f"[confy.__init__]: Merged {app_prefix}_* env vars "
+                        f"under '{app_name_key}' namespace"
+                    )
 
         # --- Step 4: Merge Explicit Overrides ---
         # Structure the overrides_dict passed to __init__
@@ -425,7 +629,12 @@ class Config(dict[str, Any]):
             f"DEBUG [confy.__init__]: Structured overrides data: {structured_overrides_data}"
         )
         if structured_overrides_data:
-            final_merged_data = deep_merge(final_merged_data, structured_overrides_data)
+            final_merged_data = deep_merge(
+                final_merged_data,
+                structured_overrides_data,
+                _source="overrides_dict",
+                _provenance=self._provenance,
+            )
             log.debug(
                 f"DEBUG [confy.__init__]: After merging overrides data: {final_merged_data}"
             )
@@ -488,6 +697,89 @@ class Config(dict[str, Any]):
             log.warning(
                 f"Warning: Failed during .env file loading (path: {dotenv_path or 'auto'}): {e}"
             )
+
+    @staticmethod
+    def _load_single_file(file_path: str) -> dict[str, Any]:
+        """Load a single JSON or TOML file and return its contents as a plain dict.
+
+        No key promotion, no merging, no defaults awareness.
+        Pure file → dict conversion.
+
+        Args:
+            file_path: Absolute or relative path to .json or .toml file.
+                Supports ``~`` and ``$VAR`` expansion.
+
+        Returns:
+            Dict of file contents.
+
+        Raises:
+            FileNotFoundError: If file doesn't exist.
+            RuntimeError: If file can't be parsed (wraps JSON/TOML errors).
+        """
+        path = Path(os.path.expanduser(os.path.expandvars(file_path)))
+
+        if not path.exists():
+            raise FileNotFoundError(f"Configuration file not found: {path}")
+
+        suffix = path.suffix.lower()
+
+        try:
+            if suffix == ".json":
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            elif suffix == ".toml":
+                if tomli is None:
+                    raise RuntimeError(
+                        "TOML support requires 'tomli' (Python <3.11) or Python 3.11+"
+                    )
+                with open(path, "rb") as f:
+                    return tomli.load(f)
+            else:
+                raise RuntimeError(
+                    f"Unsupported config file format: {suffix} (expected .json or .toml)"
+                )
+        except (json.JSONDecodeError, RuntimeError):
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse {path}: {e}") from e
+
+    @staticmethod
+    def _apply_namespace(data: dict[str, Any], namespace: str) -> dict[str, Any]:
+        """Nest file data under a namespace key, with auto-detection.
+
+        If the file already contains a top-level key matching the namespace,
+        extract that section's contents rather than double-nesting.
+
+        Also handles pyproject.toml-style ``[tool.namespace]`` nesting.
+
+        Args:
+            data: Raw dict from loaded file.
+            namespace: Target namespace key.
+
+        Returns:
+            Dict with data nested under namespace.
+
+        Examples:
+            >>> Config._apply_namespace({"chunking": {"size": 100}}, "semantiscan")
+            {'semantiscan': {'chunking': {'size': 100}}}
+
+            >>> Config._apply_namespace({"semantiscan": {"chunking": {"size": 100}}, "other": "val"}, "semantiscan")
+            {'semantiscan': {'chunking': {'size': 100}}}
+        """
+        # Case 1: File already has the namespace as a top-level key
+        if namespace in data:
+            return {namespace: data[namespace]}
+
+        # Case 2: pyproject.toml style [tool.namespace]
+        if (
+            "tool" in data
+            and isinstance(data.get("tool"), dict)
+            and namespace in data["tool"]
+        ):
+            return {namespace: data["tool"][namespace]}
+
+        # Case 3: File contents are app-specific, nest them
+        return {namespace: data}
 
     def _load_config_file(
         self, file_path: str | None, defaults_data: dict[str, Any] | None = None
@@ -932,9 +1224,21 @@ class Config(dict[str, Any]):
             raise MissingMandatoryConfig(missing)
 
     # --- Attribute Access Magic Methods ---
+    # Private attributes stored in __dict__:
+    # _prefix, _load_dotenv_file, _app_prefixes, _track_provenance, _provenance
+    _PRIVATE_ATTRS = frozenset(
+        {
+            "_prefix",
+            "_load_dotenv_file",
+            "_app_prefixes",
+            "_track_provenance",
+            "_provenance",
+        }
+    )
+
     def __getattr__(self, name: str) -> Any:
         # Store internal state with leading underscore
-        if name == "_prefix" or name == "_load_dotenv_file":
+        if name in self._PRIVATE_ATTRS:
             return self.__dict__.get(name)  # Access directly from instance dict
         if name.startswith("_"):
             raise AttributeError(
@@ -949,7 +1253,7 @@ class Config(dict[str, Any]):
 
     def __setattr__(self, name: str, value: Any):
         # Store internal state with leading underscore
-        if name == "_prefix" or name == "_load_dotenv_file":
+        if name in self._PRIVATE_ATTRS:
             self.__dict__[name] = value  # Store directly in instance dict
             return
         if name.startswith("_"):
@@ -1008,6 +1312,94 @@ class Config(dict[str, Any]):
             else:
                 plain_dict[key] = copy.deepcopy(value)
         return plain_dict
+
+    # --- App Namespace Accessor (Phase 1) ---
+    def app(self, name: str) -> "Config":
+        """Access an application's namespaced configuration.
+
+        Provides typed access to a sub-section of the config identified
+        by an application name (top-level key).
+
+        If the key doesn't exist, returns an empty Config (never raises).
+        If the key exists but isn't yet a Config, wraps it.
+
+        Args:
+            name: Application namespace (e.g., ``"llmcore"``, ``"semantiscan"``).
+
+        Returns:
+            Config object for that application's settings.
+
+        Examples:
+            >>> cfg = Config(app_defaults={"myapp": {"debug": True}})
+            >>> cfg.app("myapp").debug
+            True
+            >>> cfg.app("unknown")
+            Config({})
+        """
+        sub = self.get(name)
+        if sub is None:
+            # Create empty namespace so subsequent attribute access
+            # returns Config() instead of raising AttributeError
+            sub = Config()
+            self[name] = sub
+            return sub
+        if isinstance(sub, dict) and not isinstance(sub, Config):
+            # Wrap raw dict into Config for dot-notation access
+            wrapped = Config(sub)
+            self[name] = wrapped
+            return wrapped
+        return sub
+
+    # --- Provenance Methods (Phase 2) ---
+    def provenance(self, key: str) -> "ProvenanceEntry | None":
+        """Get provenance info for a config key.
+
+        Shows where the current value of a key came from.
+
+        Args:
+            key: Dot-notation key (e.g., ``"semantiscan.chunking.chunk_size"``).
+
+        Returns:
+            ``ProvenanceEntry`` with value, source, and key; or ``None`` if
+            provenance tracking is disabled or key not found.
+
+        Example:
+            >>> cfg = Config(track_provenance=True, defaults={"a": 1})
+            >>> cfg.provenance("a")
+            a = 1  ← defaults
+        """
+        if self._provenance is None:
+            return None
+        return self._provenance.get(key)
+
+    def provenance_history(self, key: str) -> list:
+        """Get the full override chain for a key (oldest first).
+
+        Shows how a value was set and overridden across sources.
+
+        Args:
+            key: Dot-notation key.
+
+        Returns:
+            List of ``ProvenanceEntry`` from first set to current value.
+            Empty list if tracking is disabled or key unknown.
+        """
+        if self._provenance is None:
+            return []
+        return self._provenance.get_history(key)
+
+    def provenance_dump(self) -> dict[str, str]:
+        """Dump all provenance as ``{key: source}`` dict.
+
+        Useful for debugging entire config state.
+
+        Returns:
+            Dict mapping dot-notation keys to their source strings.
+            Empty dict if provenance tracking is disabled.
+        """
+        if self._provenance is None:
+            return {}
+        return {k: v.source for k, v in self._provenance.all_entries().items()}
 
     # --- Standard Representation Methods ---
     def __repr__(self) -> str:

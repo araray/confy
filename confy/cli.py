@@ -77,8 +77,24 @@ def _flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     default=False,
     help="Disable automatic loading of .env file.",
 )
+@click.option(
+    "--track-provenance",
+    is_flag=True,
+    default=False,
+    help="Enable provenance tracking (records where each config value came from).",
+)
 @click.pass_context
-def cli(ctx, file_path, prefix, overrides, defaults, mandatory, dotenv_path, no_dotenv):
+def cli(
+    ctx,
+    file_path,
+    prefix,
+    overrides,
+    defaults,
+    mandatory,
+    dotenv_path,
+    no_dotenv,
+    track_provenance,
+):
     """
     confy CLI: inspect & mutate JSON/TOML configs via dot-notation.
 
@@ -148,6 +164,8 @@ def cli(ctx, file_path, prefix, overrides, defaults, mandatory, dotenv_path, no_
             # Pass dotenv options
             load_dotenv_file=not no_dotenv,
             dotenv_path=dotenv_path,
+            # Provenance tracking
+            track_provenance=track_provenance,
         )
     except MissingMandatoryConfig as e:
         click.secho(f"Error: {e}", fg="red", err=True)
@@ -388,6 +406,52 @@ def convert(ctx, fmt, out_file):
             ctx.exit(1)
     else:
         click.echo(output_text)
+
+
+@cli.command()
+@click.argument("key", required=False)
+@click.pass_context
+def provenance(ctx, key):
+    """Show where config values came from.
+
+    Without KEY, shows a summary of how many keys came from each source.
+    With KEY (dot-notation), shows the full override history for that key.
+
+    Requires --track-provenance flag on the main confy command.
+
+    Examples:
+
+        confy -c config.toml --track-provenance provenance
+
+        confy -c config.toml --track-provenance provenance database.host
+    """
+    cfg = ctx.obj["cfg"]
+    if not hasattr(cfg, "_provenance") or cfg._provenance is None:
+        click.secho(
+            "Provenance tracking not enabled. Use --track-provenance flag.",
+            fg="yellow",
+            err=True,
+        )
+        ctx.exit(1)
+        return
+
+    if key:
+        history = cfg.provenance_history(key)
+        if not history:
+            click.echo(f"No provenance for key: {key}")
+        else:
+            click.echo(f"Provenance history for '{key}':")
+            for i, entry in enumerate(history, 1):
+                marker = "  →" if i < len(history) else "  ★"
+                click.echo(f"{marker} {entry.source}: {entry.value!r}")
+    else:
+        summary = cfg._provenance.sources_summary()
+        if not summary:
+            click.echo("No provenance data recorded.")
+        else:
+            click.echo("Config value sources:")
+            for source, count in sorted(summary.items()):
+                click.echo(f"  {source}: {count} key(s)")
 
 
 # Make the CLI runnable (for development/testing)
