@@ -413,6 +413,180 @@ $ confy -c config.toml -p MYAPP dump
 
 In summary, the confy CLI tool is great for quick inspections (`get`, `dump`, `search`) and on-the-fly edits (`set`, `convert`). It respects the same layering system, so you can, for example, provide `--defaults` and `--overrides` to the CLI just like in code. Always be careful with `set` since it writes files in-place (make sure to backup or use version control).
 
+## Multi-App Configuration (v0.4.0)
+
+When building an ecosystem of packages that share configuration (e.g., llmcore + semantiscan), confy supports loading per-application defaults, multi-file config merging, and per-app environment variable routing — all from a single `Config` instance.
+
+### Registering App Defaults
+
+Each package in your ecosystem provides its own defaults dict. Register them via `app_defaults`:
+
+```python
+from confy.loader import Config
+
+MYAPP_DEFAULTS = {"port": 8080, "debug": False}
+WORKER_DEFAULTS = {"threads": 4, "timeout": 30}
+
+cfg = Config(
+    app_defaults={
+        "myapp": MYAPP_DEFAULTS,
+        "worker": WORKER_DEFAULTS,
+    },
+    file_path="~/.config/myapp/config.toml",
+    load_dotenv_file=False,
+)
+```
+
+App defaults are merged at the lowest precedence — any file, env var, or override will take priority.
+
+### Multi-File Loading
+
+Use `file_paths` to merge multiple config files in order (later files override earlier ones):
+
+```python
+cfg = Config(
+    app_defaults={"myapp": MYAPP_DEFAULTS},
+    file_paths=[
+        "defaults.toml",                        # Loaded first (lowest priority)
+        ("project.toml", "myapp"),               # Namespaced: contents go under cfg.myapp.*
+        "~/.config/myapp/user_overrides.toml",   # Loaded last (highest priority)
+    ],
+)
+```
+
+The tuple form `("project.toml", "myapp")` is useful when a file contains flat keys (e.g., `chunk_size = 2000`) that should be nested under a specific namespace. If the file already has `[myapp]` as a top-level section, confy detects this automatically and doesn't double-nest.
+
+### App-Specific Environment Variable Prefixes
+
+Use `app_prefixes` to route environment variables with app-specific prefixes into the correct namespace:
+
+```python
+cfg = Config(
+    app_defaults={
+        "myapp": {"port": 8080},
+        "worker": {"threads": 4},
+    },
+    prefix="GLOBAL",                      # GLOBAL_* → root config
+    app_prefixes={
+        "myapp": "MYAPP",                 # MYAPP_PORT=9090 → cfg.myapp.port = 9090
+        "worker": "WORKER",               # WORKER_THREADS=8 → cfg.worker.threads = 8
+    },
+)
+```
+
+Use double underscore (`__`) for underscored keys: `MYAPP_MAX__REQUEST__SIZE=1024` → `cfg.myapp.max_request_size = 1024`.
+
+### Accessing App Config
+
+Two equivalent access patterns:
+
+```python
+# Via app() accessor — safe, returns empty Config for unknown names
+cfg.app("myapp").port        # → 8080
+cfg.app("unknown")           # → Config({}) — empty, no error
+
+# Via direct attribute — same result, but raises AttributeError for unknown names
+cfg.myapp.port               # → 8080
+cfg.nonexistent.key           # → AttributeError
+```
+
+Use `cfg.app("name").as_dict()` to get a plain `dict` suitable for passing to libraries that don't accept `Config` objects.
+
+### Example: Wairu Ecosystem
+
+The Wairu ecosystem (llmcore, semantiscan) uses a single TOML file:
+
+```toml
+[llmcore]
+default_provider = "ollama"
+
+[llmcore.providers.ollama]
+default_model = "gemma3:1b"
+timeout = 120
+
+[logging]
+console_enabled = false
+file_enabled = true
+file_mode = "single"
+display_min_level = "INFO"
+
+[semantiscan.chunking]
+chunk_size = 2000
+chunk_overlap = 300
+
+[semantiscan.retrieval]
+top_k = 15
+```
+
+Loaded with:
+
+```python
+cfg = Config(
+    app_defaults={
+        "semantiscan": SEMANTISCAN_DEFAULTS,
+    },
+    file_path="~/.config/llmcore/config.toml",
+    prefix="LLMCORE",
+    app_prefixes={"semantiscan": "SEMANTISCAN"},
+)
+
+# All apps configured from one file
+cfg.llmcore.default_provider                 # → "ollama"
+cfg.app("semantiscan").chunking.chunk_size   # → 2000
+cfg.logging.file_mode                        # → "single"
+```
+
+## Provenance Tracking (v0.4.0)
+
+When debugging "why is this value X?", enable provenance tracking to trace how each config key was set and overridden:
+
+```python
+cfg = Config(
+    defaults={"db": {"host": "localhost", "port": 5432}},
+    file_path="config.toml",       # Contains [db] port = 3306
+    prefix="MYAPP",                # MYAPP_DB_PORT=5555 is set in env
+    track_provenance=True,
+)
+```
+
+### Querying Provenance
+
+```python
+# Where did db.port end up?
+p = cfg.provenance("db.port")
+print(p)
+# db.port = 5555  ← env:MYAPP_*
+
+# Full override chain (oldest first)
+for entry in cfg.provenance_history("db.port"):
+    print(f"  {entry.source}: {entry.value}")
+# Output:
+#   defaults: 5432
+#   file:config.toml: 3306
+#   env:MYAPP_*: 5555
+
+# Dump all provenance
+for key, source in sorted(cfg.provenance_dump().items()):
+    print(f"  {key} ← {source}")
+```
+
+### Source Labels
+
+Provenance entries use these source label formats:
+
+| Source | Format | Example |
+|---|---|---|
+| App defaults | `app_defaults:name` | `app_defaults:semantiscan` |
+| User defaults | `defaults` | `defaults` |
+| Config file | `file:/path/to/file` | `file:/home/user/.config/llmcore/config.toml` |
+| Environment | `env:PREFIX_*` | `env:LLMCORE_*` |
+| App env prefix | `app_env:PREFIX_*` | `app_env:SEMANTISCAN_*` |
+| Overrides dict | `overrides_dict` | `overrides_dict` |
+
+### Performance
+
+Provenance tracking is disabled by default (`track_provenance=False`). When disabled, there is zero overhead. When enabled, the overhead is one dict write per merged key — negligible for typical configs (<500 keys, <50KB memory).
+
 ## Best Practices and Common Pitfalls
 
 To get the most out of confy and avoid common issues, consider the following tips:

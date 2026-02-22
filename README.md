@@ -255,19 +255,118 @@ cfg = Config(
                                     # Applied first with lowest precedence.
 
     # --- Validation ---
-    mandatory: list[str] = None     # List of dot-notation keys that MUST have a value
+    mandatory: list[str] = None,    # List of dot-notation keys that MUST have a value
                                     # after all sources are merged. Raises MissingMandatoryConfig if not found.
+
+    # --- Multi-File & App Collections (v0.4.0) ---
+    file_paths: list[str | tuple[str, str]] = None,
+        # Load multiple config files in order (later files override earlier ones).
+        # Each entry is either a plain path string or a (path, namespace) tuple.
+        # Tuple form nests the file's contents under the given namespace key:
+        #   file_paths=[("semantiscan.toml", "semantiscan")]
+        # loads semantiscan.toml contents into cfg.semantiscan.*.
+        # If both file_path and file_paths are given, file_path is loaded first.
+
+    app_defaults: dict[str, dict] = None,
+        # Per-application default configs. Keys are app names (top-level namespaces),
+        # values are default config dicts. Merged before file loading (lowest precedence).
+        # Example: app_defaults={"myapp": {"debug": False, "port": 8080}}
+
+    app_prefixes: dict[str, str] = None,
+        # Per-application environment variable prefixes. Routes env vars with
+        # app-specific prefixes to the correct namespace in the config.
+        # Example: app_prefixes={"semantiscan": "SEMANTISCAN"}
+        # makes SEMANTISCAN_CHUNKING__CHUNK_SIZE set cfg.semantiscan.chunking.chunk_size.
+
+    # --- Provenance Tracking (v0.4.0) ---
+    track_provenance: bool = False,
+        # When True, records the source of every config value during merging.
+        # Use cfg.provenance("key") to see where a value came from.
+        # Disabled by default for zero overhead.
 )
 ```
 
-  - **Initialization**: Creates a configuration object by merging all specified sources according to the defined [precedence rules](https://www.google.com/search?q=%23loading-precedence). Nested dictionaries within the sources are automatically converted into `Config` objects, enabling chained dot-notation access.
+  - **Initialization**: Creates a configuration object by merging all specified sources according to the defined [precedence rules](#loading-precedence). Nested dictionaries within the sources are automatically converted into `Config` objects, enabling chained dot-notation access.
   - **Attribute Access**: Provides intuitive access to configuration values using dot notation (e.g., `cfg.section.key`). This works recursively for nested sections. It supports getting values, setting new values (`cfg.section.key = new_value`), and deleting keys (`del cfg.section.key`). Setting a dictionary value automatically wraps it in a `Config` object.
   - **Dictionary-like Behavior**: Inherits from `dict`, so standard dictionary methods like `get(key, default)`, `items()`, `keys()`, `values()` are available. The `get()` and `in` operations also support dot-notation for string keys (e.g., `cfg.get('database.host')`, `'logging.level' in cfg`).
   - **`as_dict()`**: Returns the fully resolved configuration as a standard Python dictionary. This recursively converts any nested `Config` objects back into plain dictionaries, making the result suitable for serialization (e.g., to JSON) or for passing to functions expecting standard dicts.
+  - **`app(name)`** *(v0.4.0)*: Access an application's namespaced configuration. Returns the `Config` sub-object for the given namespace (e.g., `cfg.app("semantiscan").chunking.chunk_size`). Returns an empty `Config()` for unknown names — never raises. Equivalent to `cfg.semantiscan` but with safe fallback.
+  - **`provenance(key)`** *(v0.4.0)*: When `track_provenance=True`, returns a `ProvenanceEntry` showing where the current value of a dot-notation key came from (e.g., `"file:config.toml"`, `"env:MYAPP_*"`, `"defaults"`). Returns `None` if tracking is disabled.
+  - **`provenance_history(key)`** *(v0.4.0)*: Returns the full override chain for a key as a list of `ProvenanceEntry` (oldest first). Shows how a value was set and successively overridden across sources.
+  - **`provenance_dump()`** *(v0.4.0)*: Returns a `{key: source}` dict for all tracked keys. Useful for debugging entire config state.
   - **Error Handling**:
       - Raises `confy.exceptions.MissingMandatoryConfig` if any key listed in `mandatory` is not found after merging all sources. The exception object contains a `missing_keys` attribute (a list of the missing keys).
       - Raises `FileNotFoundError` if `file_path` or `dotenv_path` (if specified) points to a non-existent file.
       - Raises `RuntimeError` wrapping underlying errors (like `json.JSONDecodeError` or `tomli.TOMLDecodeError`) if a configuration file (`file_path` or `--defaults` in CLI) is malformed or cannot be parsed.
+
+### Multi-App Configuration (v0.4.0)
+
+confy v0.4.0 supports configuring multiple applications from a single config file.
+This is designed for ecosystems where several packages share one configuration
+(e.g., llmcore + semantiscan).
+
+```python
+from confy.loader import Config
+
+# Register per-app defaults and env var prefixes
+cfg = Config(
+    app_defaults={
+        "myapp": {"debug": False, "port": 8080},
+        "worker": {"threads": 4, "timeout": 30},
+    },
+    file_path="config.toml",      # Single file with [myapp] and [worker] sections
+    prefix="GLOBAL",              # GLOBAL_* env vars (primary prefix)
+    app_prefixes={
+        "myapp": "MYAPP",         # MYAPP_* env vars → cfg.myapp.*
+        "worker": "WORKER",       # WORKER_* env vars → cfg.worker.*
+    },
+)
+
+# Access via app() accessor or direct attribute
+cfg.app("myapp").port       # → 8080 (or file/env override)
+cfg.worker.threads          # → 4 (same thing, just different syntax)
+cfg.app("unknown")          # → Config({}) — empty, no error
+```
+
+The TOML file would look like:
+
+```toml
+[myapp]
+debug = true
+port = 9090
+
+[worker]
+threads = 8
+
+[logging]
+level = "DEBUG"    # Shared section, not app-specific
+```
+
+### Provenance Tracking (v0.4.0)
+
+Enable with `track_provenance=True` to trace where each config value came from:
+
+```python
+cfg = Config(
+    defaults={"db": {"port": 5432}},
+    file_path="config.toml",       # Contains [db] port = 3306
+    track_provenance=True,
+)
+
+# See where the current value came from
+p = cfg.provenance("db.port")
+print(p)  # db.port = 3306  ← file:config.toml
+
+# See the full override chain
+for entry in cfg.provenance_history("db.port"):
+    print(f"  {entry.source}: {entry.value}")
+# Output:
+#   defaults: 5432
+#   file:config.toml: 3306
+
+# Dump all provenance
+cfg.provenance_dump()  # {"db.port": "file:config.toml", ...}
+```
 
 ### Argparse integration
 
