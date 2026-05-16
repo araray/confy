@@ -26,6 +26,17 @@ classifiers = [
   "Operating System :: OS Independent"
 ]
 
+[project.optional-dependencies]
+# Install with:  pip install -e ".[dev]"
+# These dependencies are required to run the test suite and produce
+# coverage reports. They are intentionally NOT in [project.dependencies]
+# so end users don't pull them in transitively.
+dev = [
+    "pytest>=8",
+    "pytest-cov>=4",
+    "coverage[toml]>=7",
+]
+
 [project.scripts]
 confy = "confy.cli:cli"
 
@@ -38,3 +49,60 @@ reportUnknownArgumentType = false
 reportAny = false
 reportExplicitAny = false
 reportImplicitOverride = false
+
+# ---------------------------------------------------------------------------
+# pytest configuration
+# ---------------------------------------------------------------------------
+# - testpaths:        where pytest discovers tests (single source of truth).
+# - strict_markers:   any @pytest.mark.X must be declared in `markers` below.
+#                     Configured as an INI option (not via addopts) because
+#                     pytest 9.0 applies INI options at session init time
+#                     where they reliably catch undeclared markers during
+#                     collection. The equivalent CLI flag in addopts can be
+#                     silently downgraded to a warning when discovered late.
+# - strict_config:    typo guard — unknown INI options become hard errors.
+# - addopts:          -ra shows a short summary for all non-passing outcomes.
+# - markers: every @pytest.mark.X used in the suite must be declared here.
+#   With strict_markers=true above, this list is the authoritative taxonomy.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+strict_markers = true
+strict_config = true
+addopts = "-ra"
+markers = [
+    "unit: fast pure-function unit tests (no I/O, no env mutation beyond monkeypatch)",
+    "integration: multi-component tests exercising Config end-to-end with files and env",
+    "cli: tests that exercise the click CLI via CliRunner",
+    "robustness: malformed-input, optional-dependency, and edge-case tests",
+    "slow: tests slower than ~100ms (none yet; reserved for future use)",
+]
+
+# ---------------------------------------------------------------------------
+# coverage configuration (read by both `coverage` and `pytest --cov=confy`)
+# ---------------------------------------------------------------------------
+# branch=true measures branch coverage in addition to line coverage. This
+# catches "if X: ..." branches that are never taken even though every line
+# is hit, which line-only coverage misses.
+#
+# NOTE: There is intentionally no fail_under= gate in this phase. The gate
+# will be introduced in P7 once the new test phases have lifted coverage
+# above the threshold; introducing it earlier would make CI red while we
+# build the suite up. See plan §5.
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["confy"]
+branch = true
+omit = []
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
