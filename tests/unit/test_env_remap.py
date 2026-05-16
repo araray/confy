@@ -378,3 +378,185 @@ class TestStructureOverrides:
         result = Config._structure_overrides(inp)
         result["a"]["b"].append(99)
         assert inp == {"a.b": [1, 2, 3]}
+
+
+# =============================================================================
+# Heuristic 0 — longest underscore-prefix match (I-01 fix)
+# =============================================================================
+
+
+class TestHeuristic0LongestPrefix:
+    """Heuristic 0 (post-I-01) iterates over EVERY underscore position in
+    the reconstructed flat key, from the longest possible prefix to the
+    shortest, and uses the first prefix that resolves to a *dict* in the
+    base config.
+
+    Before the fix it split on the FIRST underscore only, which failed
+    whenever an env-var path had >2 segments AND the base key contained
+    an underscore (e.g. ``feature_flags`` + ``beta_feature``). These
+    tests pin the corrected behavior.
+    """
+
+    def test_feature_flags_beta_feature_four_segments(self) -> None:
+        """The canonical bug case from the inventory: ``feature_flags``
+        is a dict in defaults and the env path is four segments deep.
+        Pre-fix this fell back to a flat ``feature_flags_beta_feature``
+        top-level key; post-fix it must nest correctly.
+        """
+        nested_env = {"feature": {"flags": {"beta": {"feature": True}}}}
+        base_defaults = {"feature_flags": {"beta_feature": False}}
+        result = Config._remap_and_flatten_env_data(
+            nested_env, base_defaults, {}, "MYAPP", False
+        )
+        assert result == {"feature_flags.beta_feature": True}
+
+    def test_db_pool_max_size(self) -> None:
+        """``MYAPP_DB_POOL_MAX_SIZE`` → ``db_pool.max_size`` when
+        ``db_pool`` is a dict containing ``max_size`` in defaults.
+        """
+        nested_env = {"db": {"pool": {"max": {"size": 100}}}}
+        base_defaults = {"db_pool": {"max_size": 10}}
+        result = Config._remap_and_flatten_env_data(
+            nested_env, base_defaults, {}, "MYAPP", False
+        )
+        assert result == {"db_pool.max_size": 100}
+
+    def test_my_section_two_segments(self) -> None:
+        """The 2-segment case the OLD heuristic 0 also handled: a single
+        underscore in the base key.
+        """
+        nested_env = {"my": {"section": "val"}}
+        base_defaults = {"my_section": "x"}
+        result = Config._remap_and_flatten_env_data(
+            nested_env, base_defaults, {}, "MYAPP", False
+        )
+        # Heuristic 0 finds "my_section" via the underscore-split path
+        # AND Attempt 1 also matches it directly; either way the result
+        # is the same.
+        assert result == {"my_section": "val"}
+
+    def test_longest_prefix_wins(self) -> None:
+        """When several underscore-prefixes of the reconstructed flat
+        key match valid base dict-keys, the LONGEST one wins (most
+        specific match).
+        """
+        nested_env = {"a": {"b": {"c": "v"}}}
+        # Both ``a`` and ``a_b`` are dicts in base; longest match
+        # (``a_b``) should be chosen.
+        base_defaults = {
+            "a_b": {"c": "x"},
+            "a": {"b_c": "y"},  # also a plausible match, but shorter prefix
+        }
+        result = Config._remap_and_flatten_env_data(
+            nested_env, base_defaults, {}, "MYAPP", False
+        )
+        assert result == {"a_b.c": "v"}
+
+    def test_prefix_must_be_dict_not_scalar(self) -> None:
+        """If the matching prefix points to a *scalar* (not a dict) in
+        base, the heuristic skips it and falls through to the next
+        candidate / fallback.
+        """
+        nested_env = {"a": {"b": "v"}}
+        base_defaults = {"a": "leaf_string"}  # ``a`` is a scalar, not dict
+        result = Config._remap_and_flatten_env_data(
+            nested_env, base_defaults, {}, "MYAPP", False
+        )
+        # No remap; falls back to flat (load_dotenv_file=False, prefix set).
+        assert result == {"a_b": "v"}
+
+    def test_three_segment_underscore_base_at_root(self) -> None:
+        """``MYAPP_FOO_BAR_BAZ`` with ``foo_bar`` (dict) and a sub-key
+        ``baz`` (leaf) in defaults → ``foo_bar.baz``.
+        """
+        nested_env = {"foo": {"bar": {"baz": 42}}}
+        base_defaults = {"foo_bar": {"baz": 0}}
+        result = Config._remap_and_flatten_env_data(
+            nested_env, base_defaults, {}, "MYAPP", False
+        )
+        assert result == {"foo_bar.baz": 42}
+
+
+# =============================================================================
+# I-05 — env_remap_fallback parameter
+# =============================================================================
+
+
+class TestEnvRemapFallback:
+    """The new ``env_remap_fallback`` parameter (I-05 fix) decouples the
+    fallback strategy from ``load_dotenv_file``. Three modes:
+
+    * ``"auto"``  — historical behavior: empty-prefix or dotenv mode →
+      nested; otherwise → flat. Default for backward compatibility.
+    * ``"nested"`` — always preserve dot form regardless of mode.
+    * ``"flat"``   — always collapse to underscore form regardless of
+      mode. Best for callers (like the argparse helper) that want a
+      deterministic shape.
+
+    These tests exercise the static :meth:`_remap_and_flatten_env_data`
+    directly; the higher-level :class:`Config` constructor merely
+    forwards the parameter.
+    """
+
+    def test_auto_dotenv_mode_is_nested_when_prefix_set(self) -> None:
+        nested_env = {"unknown": {"key": "v"}}
+        result = Config._remap_and_flatten_env_data(
+            nested_env, {}, {}, "MYAPP", True, "auto"
+        )
+        assert result == {"unknown.key": "v"}
+
+    def test_auto_no_dotenv_mode_is_flat_when_prefix_set(self) -> None:
+        nested_env = {"unknown": {"key": "v"}}
+        result = Config._remap_and_flatten_env_data(
+            nested_env, {}, {}, "MYAPP", False, "auto"
+        )
+        assert result == {"unknown_key": "v"}
+
+    def test_explicit_flat_overrides_dotenv_mode(self) -> None:
+        """The user can force flat fallback even with .env mode on."""
+        nested_env = {"unknown": {"key": "v"}}
+        result = Config._remap_and_flatten_env_data(
+            nested_env, {}, {}, "MYAPP", True, "flat"
+        )
+        # Without I-05 fix this would have been ``{"unknown.key": "v"}``:
+        assert result == {"unknown_key": "v"}
+
+    def test_explicit_nested_overrides_direct_env_mode(self) -> None:
+        """Mirror image: force nested fallback even without .env mode."""
+        nested_env = {"unknown": {"key": "v"}}
+        result = Config._remap_and_flatten_env_data(
+            nested_env, {}, {}, "MYAPP", False, "nested"
+        )
+        # Without I-05 fix this would have been ``{"unknown_key": "v"}``:
+        assert result == {"unknown.key": "v"}
+
+    def test_default_value_is_auto(self) -> None:
+        """When the param is omitted, behavior matches ``"auto"``."""
+        nested_env = {"unknown": {"key": "v"}}
+        with_default = Config._remap_and_flatten_env_data(
+            nested_env, {}, {}, "MYAPP", False
+        )
+        explicit_auto = Config._remap_and_flatten_env_data(
+            nested_env, {}, {}, "MYAPP", False, "auto"
+        )
+        assert with_default == explicit_auto
+
+    def test_empty_prefix_always_nested_under_auto(self) -> None:
+        """Empty-prefix special case under ``"auto"`` ignores
+        ``load_dotenv_file`` and always nests.
+        """
+        nested_env = {"unknown": {"key": "v"}}
+        result_t = Config._remap_and_flatten_env_data(
+            nested_env, {}, {}, "", True, "auto"
+        )
+        result_f = Config._remap_and_flatten_env_data(
+            nested_env, {}, {}, "", False, "auto"
+        )
+        assert result_t == result_f == {"unknown.key": "v"}
+
+    def test_config_constructor_validates_fallback_string(self) -> None:
+        """An invalid fallback string is rejected up-front with a clear
+        :class:`ValueError`.
+        """
+        with pytest.raises(ValueError, match="env_remap_fallback"):
+            Config(env_remap_fallback="bogus_mode")  # type: ignore[arg-type]

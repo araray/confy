@@ -327,11 +327,19 @@ class TestEmptySegments:
 
 
 class TestKnownLimitations:
-    """The leading split-on-comma in the parser means JSON arrays and
-    objects cannot be passed as ``--overrides`` values directly. This
-    test pins the *current* behavior so that anyone trying to use the
-    feature has a regression-tested expectation, and so a future syntax
-    upgrade has to consciously change this.
+    """The leading split-on-comma in the ``--overrides`` parser means
+    JSON arrays and objects cannot be passed as ``--overrides`` values
+    directly. The current behavior is preserved for backward
+    compatibility, but a clean alternative now exists:
+
+    * ``--overrides-json`` accepts a JSON object string directly and
+      handles compound values (arrays, nested objects) without the
+      comma-corruption problem documented below.
+
+    These tests pin the legacy ``--overrides`` behavior so that any
+    future change to the comma-split parser is deliberate. See the
+    :class:`TestOverridesJson` class below for the new
+    ``--overrides-json`` flag's tests.
     """
 
     def test_json_array_value_breaks_on_inner_commas(self, runner, json_config) -> None:
@@ -423,3 +431,249 @@ class TestOverridesPrecedence:
         )
         assert result.exit_code == 0
         assert json.loads(result.stdout)["k"] == "from_overrides"
+
+
+# =============================================================================
+# --overrides-json (I-04 fix)
+# =============================================================================
+
+
+class TestOverridesJson:
+    """``--overrides-json`` accepts a JSON object string directly. It
+    sidesteps the legacy comma-corruption problem in ``--overrides``
+    by parsing the entire payload through :func:`json.loads`, so
+    arrays, nested objects, and values containing commas all round-trip
+    losslessly.
+
+    Precedence: applied AFTER ``--overrides`` (last wins for conflicting
+    dot-paths). Top-level keys may use dot-notation OR nested objects;
+    both are normalized to dot-keyed form internally before the merge.
+    """
+
+    # ---- Happy paths --------------------------------------------------
+
+    def test_simple_scalar(self, runner, json_config) -> None:
+        fp = json_config({})
+        r = runner.invoke(cli, ["-c", fp, "--overrides-json", '{"k": 42}', "dump"])
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout) == {"k": 42}
+
+    def test_array_value_works(self, runner, json_config) -> None:
+        """The original ``--overrides`` quirk: ``arr:[1, 2, 3]`` is
+        comma-shredded. ``--overrides-json`` handles it cleanly.
+        """
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            ["-c", fp, "--overrides-json", '{"arr": [1, 2, 3]}', "dump"],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout) == {"arr": [1, 2, 3]}
+
+    def test_object_value_works(self, runner, json_config) -> None:
+        """Nested object value with internal commas — also works."""
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "--overrides-json",
+                '{"d": {"a": 1, "b": 2}}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        # The nested object lands at the right path:
+        parsed = json.loads(r.stdout)
+        assert parsed == {"d": {"a": 1, "b": 2}}
+
+    def test_dot_key_form_at_top_level(self, runner, json_config) -> None:
+        """Top-level dot-keys are equivalent to nested objects."""
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            ["-c", fp, "--overrides-json", '{"db.host": "h1"}', "dump"],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout) == {"db": {"host": "h1"}}
+
+    def test_mixed_dot_and_nested(self, runner, json_config) -> None:
+        """A mix of dot-key and nested forms in one --overrides-json:
+        both styles flatten to dot-keys before the merge.
+        """
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "--overrides-json",
+                '{"db": {"host": "h"}, "x.y": 1}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout) == {"db": {"host": "h"}, "x": {"y": 1}}
+
+    def test_value_with_embedded_commas(self, runner, json_config) -> None:
+        """Strings containing commas pass through untouched (no shredding)."""
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "--overrides-json",
+                '{"csv": "a,b,c,d"}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout)["csv"] == "a,b,c,d"
+
+    def test_deep_merge_preserves_siblings(self, runner, json_config) -> None:
+        """Deep-merge semantics: setting ``db.host`` via
+        ``--overrides-json`` does NOT wipe the sibling ``db.port``.
+        """
+        fp = json_config({"db": {"host": "h_old", "port": 5432}})
+        r = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "--overrides-json",
+                '{"db": {"host": "h_new"}}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        parsed = json.loads(r.stdout)
+        assert parsed["db"]["host"] == "h_new"
+        # Sibling preserved:
+        assert parsed["db"]["port"] == 5432
+
+    # ---- Error handling -----------------------------------------------
+
+    def test_invalid_json_errors_out(self, runner, json_config) -> None:
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            ["-c", fp, "--overrides-json", "{not valid json", "dump"],
+        )
+        assert r.exit_code == 1
+        # Error message names the option:
+        assert "--overrides-json" in r.stderr
+        # No silent corruption:
+        assert "parsing" in r.stderr.lower()
+
+    def test_non_object_top_level_errors_out(self, runner, json_config) -> None:
+        """Top-level must be a JSON object; arrays/scalars are rejected
+        with a friendly error (I-04 parallel of I-03).
+        """
+        fp = json_config({})
+        r = runner.invoke(cli, ["-c", fp, "--overrides-json", "[1, 2, 3]", "dump"])
+        assert r.exit_code == 1
+        assert "must be a JSON object" in r.stderr
+
+    def test_non_object_string_errors_out(self, runner, json_config) -> None:
+        fp = json_config({})
+        r = runner.invoke(cli, ["-c", fp, "--overrides-json", '"plain"', "dump"])
+        assert r.exit_code == 1
+        assert "must be a JSON object" in r.stderr
+
+    # ---- Layered precedence -------------------------------------------
+
+    def test_overrides_json_beats_overrides_for_same_key(
+        self, runner, json_config
+    ) -> None:
+        """When both ``--overrides`` and ``--overrides-json`` target
+        the same dot-path, the JSON one wins (it is documented as
+        "applied after").
+        """
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "--overrides",
+                'k:"from_classic"',
+                "--overrides-json",
+                '{"k": "from_json"}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout)["k"] == "from_json"
+
+    def test_overrides_json_disjoint_from_overrides(self, runner, json_config) -> None:
+        """When the two options touch different keys, both contribute."""
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "--overrides",
+                "a:1",
+                "--overrides-json",
+                '{"b": 2}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout) == {"a": 1, "b": 2}
+
+    def test_overrides_json_nested_vs_overrides_dotkey(
+        self, runner, json_config
+    ) -> None:
+        """A nested form in --overrides-json conflicts with a dot-key
+        form in --overrides for the same logical path. JSON one wins.
+        """
+        fp = json_config({})
+        r = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "--overrides",
+                'db.host:"h_classic"',
+                "--overrides-json",
+                '{"db": {"host": "h_json"}}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout)["db"]["host"] == "h_json"
+
+    def test_overrides_json_beats_file(self, runner, json_config) -> None:
+        """Same L5 (overrides) precedence as the classic --overrides."""
+        fp = json_config({"k": "from_file"})
+        r = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "--overrides-json",
+                '{"k": "from_json"}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout)["k"] == "from_json"
+
+    def test_overrides_json_beats_defaults(self, runner, defaults_file) -> None:
+        df = defaults_file({"k": "from_defaults"})
+        r = runner.invoke(
+            cli,
+            [
+                "--defaults",
+                df,
+                "--overrides-json",
+                '{"k": "from_json"}',
+                "dump",
+            ],
+        )
+        assert r.exit_code == 0, r.stderr
+        assert json.loads(r.stdout)["k"] == "from_json"

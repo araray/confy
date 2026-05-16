@@ -253,10 +253,26 @@ cfg = Config(
                                                 # Applied last with highest precedence.
     defaults: dict = None,          # Dictionary of default configuration values.
                                     # Applied first with lowest precedence.
+                                    # NOTE (I-19): the dict is deep-copied internally
+                                    # before merging, so mutations to your original
+                                    # `defaults` dict after the Config is built do NOT
+                                    # leak into the configuration, and vice versa.
 
     # --- Validation ---
     mandatory: list[str] = None,    # List of dot-notation keys that MUST have a value
                                     # after all sources are merged. Raises MissingMandatoryConfig if not found.
+
+    # --- Env-var Remap Fallback (v0.4.1, I-05) ---
+    env_remap_fallback: str = "auto",
+        # Controls the fallback shape used when an env-var key cannot be
+        # remapped against defaults/file structure:
+        #   "auto"   — historical behavior, tied to load_dotenv_file:
+        #              nested when True, flat when False.
+        #   "nested" — always preserve the dot form (e.g. env.only).
+        #   "flat"   — always collapse to the underscore form (e.g.
+        #              env_only). Recommended for callers that don't
+        #              want the .env switch to silently restructure
+        #              their env-only keys.
 
     # --- Multi-File & App Collections (v0.4.0) ---
     file_paths: list[str | tuple[str, str]] = None,
@@ -290,7 +306,7 @@ cfg = Config(
   - **Attribute Access**: Provides intuitive access to configuration values using dot notation (e.g., `cfg.section.key`). This works recursively for nested sections. It supports getting values, setting new values (`cfg.section.key = new_value`), and deleting keys (`del cfg.section.key`). Setting a dictionary value automatically wraps it in a `Config` object.
   - **Dictionary-like Behavior**: Inherits from `dict`, so standard dictionary methods like `get(key, default)`, `items()`, `keys()`, `values()` are available. The `get()` and `in` operations also support dot-notation for string keys (e.g., `cfg.get('database.host')`, `'logging.level' in cfg`).
   - **`as_dict()`**: Returns the fully resolved configuration as a standard Python dictionary. This recursively converts any nested `Config` objects back into plain dictionaries, making the result suitable for serialization (e.g., to JSON) or for passing to functions expecting standard dicts.
-  - **`app(name)`** *(v0.4.0)*: Access an application's namespaced configuration. Returns the `Config` sub-object for the given namespace (e.g., `cfg.app("semantiscan").chunking.chunk_size`). Returns an empty `Config()` for unknown names — never raises. Equivalent to `cfg.semantiscan` but with safe fallback.
+  - **`app(name)`** *(v0.4.0; behavior documented under I-18)*: Access an application's namespaced configuration. Returns the `Config` sub-object for the given namespace (e.g., `cfg.app("semantiscan").chunking.chunk_size`). Returns an empty `Config()` for unknown names — never raises. **Important**: if the requested namespace is missing, calling `cfg.app(name)` **wraps in place** — it side-effectfully writes an empty `Config()` under `cfg[name]` (so subsequent `name in cfg` returns True). This is intentional, to make the returned sub-object writable and mergeable, but callers who want pure read-only inspection should use `cfg.get(name, {})` instead.
   - **`provenance(key)`** *(v0.4.0)*: When `track_provenance=True`, returns a `ProvenanceEntry` showing where the current value of a dot-notation key came from (e.g., `"file:config.toml"`, `"env:MYAPP_*"`, `"defaults"`). Returns `None` if tracking is disabled.
   - **`provenance_history(key)`** *(v0.4.0)*: Returns the full override chain for a key as a list of `ProvenanceEntry` (oldest first). Shows how a value was set and successively overridden across sources.
   - **`provenance_dump()`** *(v0.4.0)*: Returns a `{key: source}` dict for all tracked keys. Useful for debugging entire config state.
@@ -298,6 +314,31 @@ cfg = Config(
       - Raises `confy.exceptions.MissingMandatoryConfig` if any key listed in `mandatory` is not found after merging all sources. The exception object contains a `missing_keys` attribute (a list of the missing keys).
       - Raises `FileNotFoundError` if `file_path` or `dotenv_path` (if specified) points to a non-existent file.
       - Raises `RuntimeError` wrapping underlying errors (like `json.JSONDecodeError` or `tomli.TOMLDecodeError`) if a configuration file (`file_path` or `--defaults` in CLI) is malformed or cannot be parsed.
+      - Raises `ValueError` if `env_remap_fallback` is not one of `"auto"`, `"nested"`, `"flat"`.
+
+#### Reserved attribute names (I-20)
+
+Because `Config` inherits from `dict`, a small set of attribute names are
+**reserved** for the dict / Config API and cannot be used as config keys
+without surprising behavior:
+
+```text
+items, keys, values, get, update, pop, clear, copy, setdefault, as_dict, app,
+provenance, provenance_history, provenance_dump
+```
+
+If your configuration legitimately needs a key named (say) `items` or `keys`,
+use bracket-style access only:
+
+```python
+cfg = Config({"items": [1, 2, 3]})
+cfg["items"]   # ✓ works as expected — returns [1, 2, 3]
+cfg.items      # ✗ returns the bound method <dict.items of {...}>, NOT [1, 2, 3]
+```
+
+In practice, prefer renaming such keys at the source (e.g. `record_items`,
+`event_keys`). The dot-notation accessor (`cfg.foo.bar`) is unaffected for
+any key that is not in the reserved list above.
 
 ### Multi-App Configuration (v0.4.0)
 
@@ -467,22 +508,63 @@ Usage: confy [OPTIONS] COMMAND [ARGS]...
   variables (with prefix), and explicit overrides. Requires Python 3.10+.
 
 Options:
-  -c, --config PATH     Path to the primary JSON or TOML config file to load.
-  -p, --prefix TEXT     Case-insensitive prefix for environment variable overrides
-                        (e.g., 'APP_CONF').
-  --overrides TEXT      Comma-separated 'dot.key:json_value' pairs for final
-                        overrides (e.g., "db.port:5433,log.level:\"DEBUG\"").
-  --defaults PATH       Path to a JSON file containing default values (lowest
-                        precedence).
-  --mandatory TEXT      Comma-separated list of mandatory dot-keys that must
-                        exist after loading.
-  --dotenv-path PATH    Explicit path to the .env file to load. If not set,
-                        searches automatically.
-  --no-dotenv           Disable automatic loading of the .env file.
-  -h, --help            Show this message and exit.
+  -c, --config PATH        Path to the primary JSON or TOML config file to load.
+  -p, --prefix TEXT        Case-insensitive prefix for environment variable
+                           overrides (e.g., 'APP_CONF').
+  --overrides TEXT         Comma-separated 'dot.key:json_value' pairs for final
+                           overrides (e.g., "db.port:5433,log.level:\"DEBUG\"").
+                           Note: legacy syntax — comma-splits the input first,
+                           so JSON arrays/objects containing commas are
+                           corrupted. Use --overrides-json for those cases.
+  --overrides-json TEXT    JSON object string with overrides; supports
+                           compound values (arrays/objects) without
+                           comma-corruption. Keys may use dot-notation.
+                           Applied AFTER --overrides (last wins on conflict).
+                           Example:
+                             --overrides-json '{"db":{"hosts":["h1","h2"]}}'
+  --defaults PATH          Path to a JSON file containing default values
+                           (lowest precedence). Supports ~ and $VAR expansion
+                           (I-02). Must contain a JSON object at the top level;
+                           non-object payloads (array/string/number/bool) are
+                           rejected with a friendly error (I-03).
+  --mandatory TEXT         Comma-separated list of mandatory dot-keys that
+                           must exist after loading.
+  --dotenv-path PATH       Explicit path to the .env file to load. If not set,
+                           searches automatically.
+  --no-dotenv              Disable automatic loading of the .env file.
+  --track-provenance       Enable provenance tracking (records where each
+                           config value came from). Disabled by default.
+  -h, --help               Show this message and exit.
 ```
 
-> **Reminder:** The loading precedence (`defaults` → `config file` → `.env` → `environment variables` → `overrides`) applies fully when using the CLI tool.
+> **Reminder:** The loading precedence (`defaults` → `config file` → `.env` → `environment variables` → `overrides` → `overrides-json`) applies fully when using the CLI tool.
+
+#### `--overrides` vs `--overrides-json` (v0.4.1, I-04)
+
+The legacy `--overrides` flag uses a simple comma-split parser:
+
+```bash
+confy --overrides 'db.host:"primary",db.port:5433' dump
+```
+
+This works for scalar values but breaks on JSON arrays/objects because the
+comma inside the value collides with the pair separator:
+
+```bash
+# ❌ broken: comma-shredded into 3 fragments
+confy --overrides 'arr:[1, 2, 3]' dump
+
+# ✅ correct: --overrides-json parses the whole payload as JSON
+confy --overrides-json '{"arr": [1, 2, 3]}' dump
+```
+
+When both are supplied for the same dot-path, `--overrides-json` wins
+(it is applied *after* `--overrides`):
+
+```bash
+confy --overrides 'k:"from_classic"' --overrides-json '{"k": "from_json"}' dump
+# → {"k": "from_json"}
+```
 
 ### Subcommands
 
@@ -553,23 +635,33 @@ confy -c config.toml exists non_existent_section.key || echo "Key not found."
 
 #### `search` Example
 
-Find keys or values using patterns (plain text, globs `*?[]`, or regular expressions).
+Find keys or values using patterns. The default auto-detection picks between
+plain text, glob (`*?[]`), and regex based on the pattern shape. For explicit
+control, use the **mutually-exclusive mode flags** added in v0.4.1 (I-08):
+
+| Flag      | Force mode | Notes                                                                                                      |
+| --------- | ---------- | ---------------------------------------------------------------------------------------------------------- |
+| (none)    | auto       | Heuristic detection; glob is **always case-insensitive** in this mode regardless of `-i` (preserved for back-compat, I-09). |
+| `--regex` | regex      | `re.search` semantics. Invalid regex syntax returns no matches (vs. silent substring degradation in auto). |
+| `--glob`  | glob       | `fnmatch` semantics. **Case-sensitive by default**; combine with `-i` to fold case (I-09 resolution).      |
+| `--exact` | exact      | String equality. **Case-sensitive by default**; combine with `-i` to fold case.                            |
 
 ```bash
-# Find all keys under the 'database' section
+# Auto mode (legacy behavior)
 confy -c config.toml search --key 'database.*'
-
-# Find all keys ending with 'port' (case-insensitive glob)
 confy -c config.toml search --key '*port' -i
-
-# Find all settings with the exact string value "localhost"
 confy -c config.toml search --val 'localhost'
-
-# Find settings whose value is 'true' or 'false' (regex, case-insensitive)
 confy -c config.toml search --val '^(true|false)$' -i
-
-# Find keys matching 'db.*' whose value contains 'prod' (case-insensitive glob for value)
 confy -c config.toml search --key 'db.*' --val '*prod*' -i
+
+# Force regex even on a plain word (substring search):
+confy -c config.toml search --key host --regex
+
+# Force exact-literal matching of a regex-looking string:
+confy -c config.toml search --key 'feature.flags' --exact
+
+# Force case-sensitive glob (auto mode would lowercase both sides):
+confy -c config.toml search --key 'DB*' --glob
 ```
 
 #### `dump` Example
@@ -615,10 +707,16 @@ confy -c config.json --defaults def.json convert --to toml --out effective_confi
       - **Examples:**
           - `MYAPP_DATABASE_HOST` → `database.host`
           - `MYAPP_LOGGING_LEVEL` → `logging.level`
-          - `MYAPP_FEATURE_FLAGS__BETA_FEATURE` → `feature_flags.beta_feature` (if `feature_flags` exists as a section)
-          - `MYAPP_USER__LOGIN_ATTEMPTS` → `user.login_attempts` (if `user` exists as a section)
-          - `MYAPP_RAW_KEY_WITH__UNDERSCORE` -\> `raw_key_with_underscore` (if no matching section found during remapping)
-  - **Remapping:** After the initial underscore conversion, `confy` attempts to remap the resulting dot-key (e.g., `feature.flags.beta.feature`) to match the structure of your `defaults` and config file data (e.g., to `feature_flags.beta_feature`). See `_remap_and_flatten_env_data` in `loader.py` for the detailed logic, including handling for base keys that contain underscores.
+          - `MYAPP_FEATURE_FLAGS__BETA_FEATURE` → `feature_flags.beta_feature` (explicit `__` form; the `feature_flags` section need not exist)
+          - `MYAPP_USER__LOGIN_ATTEMPTS` → `user.login_attempts` (explicit `__` form)
+          - `MYAPP_RAW_KEY_WITH__UNDERSCORE` → `raw_key_with_underscore` (if no matching section found during remapping)
+  - **Remapping (Heuristic 0, v0.4.1):** After the initial underscore conversion, `confy` attempts to remap the resulting dot-key (e.g., `feature.flags.beta.feature`) to match the structure of your `defaults` and config file data (e.g., to `feature_flags.beta_feature`). The remapper iterates over **every** underscore-prefix position in the reconstructed flat key (`feature_flags_beta_feature`), from longest to shortest, and uses the first prefix that resolves to a dict in your base config. So `MYAPP_FEATURE_FLAGS_BETA_FEATURE` (without `__`) correctly nests under `feature_flags.beta_feature` if `feature_flags` is a known section — even though there are four single-underscore segments. See `_remap_and_flatten_env_data` in `loader.py` for the full algorithm (I-01 fix).
+  - **Fallback for unresolvable keys (`env_remap_fallback`, v0.4.1, I-05):** If no remap target is found, `confy` falls back to one of two shapes. The strategy is controlled by the `env_remap_fallback` constructor parameter:
+      - `"auto"` (default) — historical behavior: nested (dot-form) when `load_dotenv_file=True` or `prefix=""`, flat (underscore-form) otherwise.
+      - `"nested"` — always preserve dot-form (e.g. `env.only`).
+      - `"flat"` — always collapse to underscore-form (e.g. `env_only`).
+
+    The `argparse_integration.load_config_from_args` helper passes `env_remap_fallback="flat"` for deterministic behavior independent of the `.env` loading toggle.
   - **Type Parsing:** `confy` attempts to parse the environment variable's value as JSON. This allows setting booleans (`true`/`false`), numbers (`123`), and properly quoted strings (`"hello world"`). If JSON parsing fails, the raw string value is used.
     ```bash
     export MYAPP_DATABASE_PORT=5433         # Parsed as integer 5433
@@ -626,6 +724,7 @@ confy -c config.json --defaults def.json convert --to toml --out effective_confi
     export MYAPP_LOGGING_LEVEL='"DEBUG"'    # Parsed as string "DEBUG"
     export MYAPP_API_KEY=raw_secret_key     # Used as raw string "raw_secret_key"
     ```
+  - **Special tokens NOT parsed as float (v0.4.1, I-06):** The IEEE 754 special tokens `inf`, `-inf`, `+inf`, `infinity`, `nan`, `-nan`, `+nan` (case-insensitive) are intentionally **rejected** by the value parser and round-tripped as raw strings. End-user configuration values rarely mean the literal special float; `MYAPP_TIMEOUT=inf` almost always means the three-character string. If you genuinely need positive infinity, set the value programmatically via `overrides_dict={"timeout": math.inf}`.
 
 ### `.env` File Handling Details
 
@@ -772,11 +871,18 @@ tests/
 
 ### Coverage gate
 
-`pyproject.toml` enforces a minimum of `fail_under = 90`. Drop below that and `pytest --cov=confy` exits with code 1. The actual achieved coverage (~95.8%) is well above the gate; the margin exists so a small, conscious regression doesn't immediately break CI while still catching unintended drops.
+`pyproject.toml` enforces a minimum of `fail_under = 90`. Drop below that and `pytest --cov=confy` exits with code 1. The actual achieved coverage (~98.3% after the v0.4.1 fixes) is well above the gate; the margin exists so a small, conscious regression doesn't immediately break CI while still catching unintended drops.
 
-### Known xfailed tests
+### Previously xfailed tests (now passing, v0.4.1)
 
-Four tests in `tests/test_loader.py` are marked `@pytest.mark.xfail(strict=True)` because they depend on a specific behavior of `_remap_and_flatten_env_data` (Heuristic 0 underscore handling) that doesn't work as expected for multi-underscore base keys. See [CONTRIBUTING.md](CONTRIBUTING.md#known-library-quirks) for the full list of documented quirks.
+Prior to v0.4.1, four tests in `tests/test_loader.py` were marked
+`@pytest.mark.xfail(strict=True)` because they depended on a multi-underscore
+remapping behavior (`feature_flags.beta_feature` from
+`MYAPP_FEATURE_FLAGS_BETA_FEATURE` without explicit `__`) that the original
+Heuristic 0 did not implement. The I-01 fix in v0.4.1 (longest-underscore-prefix
+scan in `_remap_and_flatten_env_data`) makes all four tests pass; the
+`xfail` markers have been removed. See `tests/unit/test_env_remap.py` →
+`TestHeuristic0LongestPrefix` for the unit-level pins of the fix.
 
 ### Adding new tests
 

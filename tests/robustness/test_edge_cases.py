@@ -303,17 +303,18 @@ class TestNumericEdgeCases:
         assert cfg.tiny == tiny
 
     def test_inf_via_parse_value(self, monkeypatch) -> None:
-        """Env var ``inf`` is accidentally accepted as a float by
-        :func:`_parse_value` (Python's ``float("inf")`` returns infinity).
-        Pinned in test_parse_value.py at the unit level; here we just
-        verify the behavior propagates end-to-end through env loading.
+        """I-06: env var ``inf`` is intentionally NOT parsed as a float
+        (Python's ``float("inf")`` would return positive infinity).
+        :func:`_parse_value` now guards against those special tokens
+        and falls back to the raw string, so the user gets the
+        three-character string they typed, not a surprising IEEE 754
+        special float that would later confuse JSON serialization,
+        comparisons, etc.
         """
-        import math
-
         monkeypatch.setenv("MYAPP_K", "inf")
         cfg = Config(prefix="MYAPP", load_dotenv_file=False)
-        assert math.isinf(cfg.k)
-        assert cfg.k > 0  # positive infinity
+        assert isinstance(cfg.k, str)
+        assert cfg.k == "inf"
 
 
 # =============================================================================

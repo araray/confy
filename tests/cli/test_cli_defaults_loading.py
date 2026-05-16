@@ -157,46 +157,48 @@ class TestMalformedFile:
 class TestNonObjectTopLevel:
     """JSON allows arrays, strings, numbers, and booleans as top-level
     values. confy's :class:`Config` only accepts a dict for defaults,
-    so non-object top-levels crash with::
+    so non-object top-levels are rejected at the CLI layer with a
+    user-friendly error message (I-03 fix).
 
-        Error initializing configuration: 'X' object has no attribute 'items'
-
-    This error message is **confusing for end users** — it leaks an
-    internal type name and doesn't suggest the fix. We pin the current
-    behavior here, but flag it as a UX issue. A future enhancement
-    should detect non-dict input and raise a user-friendly message in
-    the defaults-loading block.
+    The friendly message names the offending type (``list``, ``str``,
+    ``int``, ``bool``) and the source path, so the user can pinpoint
+    what to fix without staring at a confusing ``'X' object has no
+    attribute 'items'`` Python-internal stack trace.
     """
 
-    def test_top_level_array_crashes(self, runner, tmp_path) -> None:
+    @staticmethod
+    def _assert_friendly_error(result, type_name: str) -> None:
+        assert result.exit_code == 1
+        # Friendly message: includes "JSON object", names the actual type,
+        # and does NOT leak the internal ``'X' object has no attribute
+        # 'items'`` formulation.
+        assert "json object" in result.stderr.lower()
+        assert type_name in result.stderr
+        assert "object has no attribute 'items'" not in result.stderr
+
+    def test_top_level_array_is_rejected(self, runner, tmp_path) -> None:
         bad = tmp_path / "array.json"
         bad.write_text("[1, 2, 3]")
         result = runner.invoke(cli, ["--defaults", str(bad), "dump"])
-        # Crashes — exit 1 from the generic exception handler:
-        assert result.exit_code == 1
-        # The leaked internal error message:
-        assert "object has no attribute 'items'" in result.stderr
+        self._assert_friendly_error(result, "list")
 
-    def test_top_level_string_crashes(self, runner, tmp_path) -> None:
+    def test_top_level_string_is_rejected(self, runner, tmp_path) -> None:
         bad = tmp_path / "string.json"
         bad.write_text('"just a string"')
         result = runner.invoke(cli, ["--defaults", str(bad), "dump"])
-        assert result.exit_code == 1
-        assert "object has no attribute 'items'" in result.stderr
+        self._assert_friendly_error(result, "str")
 
-    def test_top_level_number_crashes(self, runner, tmp_path) -> None:
+    def test_top_level_number_is_rejected(self, runner, tmp_path) -> None:
         bad = tmp_path / "number.json"
         bad.write_text("42")
         result = runner.invoke(cli, ["--defaults", str(bad), "dump"])
-        assert result.exit_code == 1
-        assert "object has no attribute 'items'" in result.stderr
+        self._assert_friendly_error(result, "int")
 
-    def test_top_level_bool_crashes(self, runner, tmp_path) -> None:
+    def test_top_level_bool_is_rejected(self, runner, tmp_path) -> None:
         bad = tmp_path / "bool.json"
         bad.write_text("true")
         result = runner.invoke(cli, ["--defaults", str(bad), "dump"])
-        assert result.exit_code == 1
-        assert "object has no attribute 'items'" in result.stderr
+        self._assert_friendly_error(result, "bool")
 
 
 # =============================================================================
@@ -247,17 +249,16 @@ class TestNullTopLevel:
 
 
 class TestPathExpansion:
-    """``--defaults`` does NOT apply :func:`os.path.expanduser` to its
-    argument, unlike ``--config`` (which does, via the loader). This is
-    an inconsistency between the two options.
-
-    We pin the current behavior here so an intentional fix has to
-    update these tests.
+    """``--defaults`` applies :func:`os.path.expanduser` and
+    :func:`os.path.expandvars` to its argument, matching the
+    ``--config`` option's behavior (I-02 fix). Both ``~`` and
+    ``$VAR`` are expanded before the file is opened.
     """
 
-    def test_tilde_path_not_expanded(self, runner, tmp_path) -> None:
-        """``~/foo.json`` is treated as a literal path (no expansion),
-        so it fails with "not found" even if ``$HOME/foo.json`` exists.
+    def test_tilde_path_is_expanded(self, runner, tmp_path) -> None:
+        """``~/foo.json`` is expanded to ``$HOME/foo.json`` before
+        :func:`open`, so a file at the resolved location is loaded
+        correctly.
         """
         # Plant a file at $HOME/_confy_test_defaults.json by setting
         # HOME via env injection:
@@ -269,18 +270,16 @@ class TestPathExpansion:
             ["--defaults", "~/_confy_test_defaults.json", "dump"],
             env={"HOME": str(tmp_path)},
         )
-        # Currently fails — the ~ is not expanded. If this test starts
-        # to PASS, someone added expansion logic; update or remove the
-        # test accordingly.
-        assert result.exit_code == 1
-        assert "not found" in result.stderr.lower()
+        # With expansion in place, the file is found and loaded:
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout) == {"k": "from_tilde"}
 
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="POSIX-style env var expansion check",
     )
-    def test_env_var_in_path_not_expanded(self, runner, tmp_path) -> None:
-        """``$VAR/foo.json`` is also not expanded — same gap."""
+    def test_env_var_in_path_is_expanded(self, runner, tmp_path) -> None:
+        """``$VAR/foo.json`` is expanded too (POSIX ``$VAR`` form)."""
         df = tmp_path / "vendor.json"
         df.write_text(json.dumps({"k": "v"}))
 
@@ -288,6 +287,20 @@ class TestPathExpansion:
             cli,
             ["--defaults", "$MYVAR/vendor.json", "dump"],
             env={"MYVAR": str(tmp_path)},
+        )
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout) == {"k": "v"}
+
+    def test_missing_after_expansion_still_errors(self, runner, tmp_path) -> None:
+        """Expansion is a transformation, not a guarantee — if the
+        post-expansion path doesn't exist, the usual not-found error
+        still applies. The error message references the original
+        user-supplied path for clarity.
+        """
+        result = runner.invoke(
+            cli,
+            ["--defaults", "~/_nonexistent_confy_test.json", "dump"],
+            env={"HOME": str(tmp_path)},
         )
         assert result.exit_code == 1
         assert "not found" in result.stderr.lower()

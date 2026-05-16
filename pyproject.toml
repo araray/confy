@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "confy"
-version = "0.4.0"
+version = "0.5.0"
 description = "Minimal Python configuration library with dot-notation, JSON/TOML, env-var and dict overrides."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,7 +51,7 @@ minversion = "8.0"
 testpaths = ["tests"]
 strict_markers = true
 strict_config = true
-addopts = "-ra"
+addopts = "-rfE"
 markers = [
     "unit: fast pure-function unit tests (no I/O, no env mutation beyond monkeypatch)",
     "integration: multi-component tests exercising Config end-to-end with files and env",

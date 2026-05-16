@@ -18,13 +18,68 @@ from .exceptions import MissingMandatoryConfig
 from .loader import Config, set_by_dot
 
 
-def _match(pattern: str, text: str, ignore_case: bool = False) -> bool:
+def _match(
+    pattern: str,
+    text: str,
+    ignore_case: bool = False,
+    mode: str = "auto",
+) -> bool:
+    """Match ``text`` against ``pattern`` using the requested ``mode``.
+
+    Modes
+    -----
+    * ``"auto"`` (default) — backward-compatible auto-detection:
+
+        1. Glob if ``pattern`` contains ``*``, ``?``, ``[`` or ``]``.
+        2. Regex if ``pattern`` contains other regex-special chars and
+           is a valid regex.
+        3. Otherwise: exact, case-insensitive equality.
+
+      ``ignore_case=True`` only affects the regex branch under
+      ``"auto"`` mode (glob and exact branches are already
+      case-insensitive there).
+    * ``"regex"`` — always treat the pattern as a regular expression
+      (``re.search`` semantics). ``ignore_case`` enables
+      :data:`re.IGNORECASE`.
+    * ``"glob"`` — always treat the pattern as a glob via
+      :func:`fnmatch.fnmatch`. ``ignore_case`` selects
+      :func:`fnmatch.fnmatch` (case-insensitive) vs
+      :func:`fnmatch.fnmatchcase` (case-sensitive).
+    * ``"exact"`` — string equality. ``ignore_case`` controls case
+      folding.
+
+    Args:
+        pattern: The user-supplied search pattern.
+        text:    The candidate string to match against.
+        ignore_case: Case-insensitivity flag (semantics vary by mode).
+        mode:    Explicit match strategy; see above.
+
+    Returns:
+        ``True`` iff the pattern matches ``text`` under the chosen mode.
     """
-    Match text against pattern with:
-      • Glob (case-insensitive)
-      • Regex (case-sensitive by default, -i to ignore case)
-      • Exact (case-insensitive)
-    """
+    # I-08: explicit modes bypass auto-detection.
+    if mode == "regex":
+        flags = re.IGNORECASE if ignore_case else 0
+        try:
+            return re.search(pattern, text, flags) is not None
+        except re.error:
+            # Explicit regex with invalid syntax: no match (rather than
+            # silently degrading to substring like the auto path would).
+            return False
+
+    if mode == "glob":
+        if ignore_case:
+            return fnmatch.fnmatch(text.lower(), pattern.lower())
+        return fnmatch.fnmatchcase(text, pattern)
+
+    if mode == "exact":
+        if ignore_case:
+            return text.lower() == pattern.lower()
+        return text == pattern
+
+    # ``mode == "auto"`` (or any unknown value): fall through to the
+    # historical auto-detection path so existing callers and tests
+    # continue to work unchanged.
     # 1) Glob if it contains *, ?, [ or ]
     if any(c in pattern for c in "*?[]"):
         return fnmatch.fnmatch(text.lower(), pattern.lower())
@@ -67,6 +122,15 @@ def _flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
 @click.option("-c", "--config", "file_path", help="JSON/TOML config file to load.")
 @click.option("-p", "--prefix", help="Env-var prefix for overrides (e.g., APP_CONF).")
 @click.option("--overrides", help="Comma-sep `key:json_val` pairs for overrides.")
+@click.option(
+    "--overrides-json",
+    "overrides_json",
+    help=(
+        "JSON object string with overrides; supports compound values "
+        "(arrays/objects) without comma-corruption. Keys may use "
+        "dot-notation. Applied AFTER --overrides (last wins)."
+    ),
+)
 @click.option("--defaults", help="Path to JSON file containing default values.")
 @click.option("--mandatory", help="Comma-sep list of mandatory dot-keys.")
 # Add options for .env file handling
@@ -89,6 +153,7 @@ def cli(
     file_path,
     prefix,
     overrides,
+    overrides_json,
     defaults,
     mandatory,
     dotenv_path,
@@ -112,9 +177,13 @@ def cli(
     # 1) load defaults.json if provided
     defaults_dict = {}
     if defaults:
+        # I-02: expand ~ and $VAR in the user-supplied path so that --defaults
+        # is consistent with --config (which goes through the loader's own
+        # path normalization).
+        defaults_path = os.path.expandvars(os.path.expanduser(defaults))
         try:
-            with open(defaults, encoding="utf-8") as f:
-                defaults_dict = json.load(f)
+            with open(defaults_path, encoding="utf-8") as f:
+                raw_defaults = json.load(f)
         except FileNotFoundError:
             click.secho(
                 f"Error: Defaults file not found: {defaults}", fg="red", err=True
@@ -125,6 +194,25 @@ def cli(
                 f"Error parsing defaults file {defaults}: {e}", fg="red", err=True
             )
             ctx.exit(1)
+        else:
+            # I-03: friendly error for non-object top-level JSON. The
+            # ``Config`` constructor expects a dict for ``defaults=``; null
+            # is silently accepted (treated as "no defaults supplied"), but
+            # arrays / strings / numbers / booleans would otherwise crash
+            # with a confusing ``'X' object has no attribute 'items'`` deep
+            # in the merge logic.
+            if raw_defaults is None:
+                defaults_dict = {}
+            elif not isinstance(raw_defaults, dict):
+                click.secho(
+                    f"Error: --defaults file must contain a JSON object "
+                    f"(got {type(raw_defaults).__name__}): {defaults}",
+                    fg="red",
+                    err=True,
+                )
+                ctx.exit(1)
+            else:
+                defaults_dict = raw_defaults
 
     # 2) parse overrides to dict
     overrides_dict = {}
@@ -149,6 +237,39 @@ def cli(
                     err=True,
                 )
 
+    # 2b) I-04: parse --overrides-json. Additive on top of --overrides;
+    # last-wins for any keys that appear in both (since --overrides-json
+    # is documented as applied AFTER --overrides). The value must be a
+    # JSON object string at the top level; nested objects are flattened
+    # into dot-keys via :func:`_flatten` so that ``deep_merge``'s
+    # per-key semantics apply uniformly regardless of how the user
+    # wrote the input (nested form, dot-key form, or a mix).
+    if overrides_json:
+        try:
+            raw_json = json.loads(overrides_json)
+        except json.JSONDecodeError as e:
+            click.secho(
+                f"Error parsing --overrides-json: {e}",
+                fg="red",
+                err=True,
+            )
+            ctx.exit(1)
+        else:
+            if not isinstance(raw_json, dict):
+                click.secho(
+                    f"Error: --overrides-json must be a JSON object "
+                    f"(got {type(raw_json).__name__})",
+                    fg="red",
+                    err=True,
+                )
+                ctx.exit(1)
+            # Flatten nested structure into dot-keys, then merge into
+            # overrides_dict. dict.update gives last-wins semantics, which
+            # is the documented precedence (--overrides-json beats
+            # --overrides on conflicting paths).
+            flat_json = _flatten(raw_json)
+            overrides_dict.update(flat_json)
+
     # 3) mandatory list
     mandatory_list = [k.strip() for k in mandatory.split(",")] if mandatory else []
 
@@ -170,15 +291,15 @@ def cli(
     except MissingMandatoryConfig as e:
         click.secho(f"Error: {e}", fg="red", err=True)
         ctx.exit(1)
-        raise  # This line will never execute, but helps type checker
+        raise  # pragma: no cover  -- helps type-checker; unreachable at runtime (ctx.exit raises)
     except FileNotFoundError as e:
         click.secho(f"Error: {e}", fg="red", err=True)
         ctx.exit(1)
-        raise  # This line will never execute, but helps type checker
+        raise  # pragma: no cover  -- helps type-checker; unreachable at runtime (ctx.exit raises)
     except Exception as e:  # Catch other potential init errors
         click.secho(f"Error initializing configuration: {e}", fg="red", err=True)
         ctx.exit(1)
-        raise  # This line will never execute, but helps type checker
+        raise  # pragma: no cover  -- helps type-checker; unreachable at runtime (ctx.exit raises)
 
     ctx.obj = {
         "cfg": cfg,
@@ -201,11 +322,13 @@ def get(ctx, key):
     except KeyError:
         click.secho(f"Key not found: {key}", fg="yellow", err=True)
         ctx.exit(1)
-        raise  # This line will never execute, but helps type checker
-    except TypeError as e:  # Handle invalid path errors during get
-        click.secho(f"Error accessing key '{key}': {e}", fg="red", err=True)
-        ctx.exit(1)
-        raise  # This line will never execute, but helps type checker
+        raise  # pragma: no cover  -- helps type-checker; unreachable at runtime (ctx.exit raises)
+    # I-15: the previous ``except TypeError as e:`` handler was removed.
+    # ``cfg.get`` for a string dot-key delegates to ``get_by_dot`` which
+    # only raises :class:`KeyError` (above) or propagates a genuine
+    # programming bug. If a future change starts raising :class:`TypeError`
+    # here it should bubble up as an actual stack trace rather than be
+    # swallowed with a friendly-looking exit code.
 
     # Dump the retrieved value as JSON
     click.echo(json.dumps(val, indent=2))
@@ -246,14 +369,21 @@ def set(ctx, key, value):
                 f"Error: Unsupported file type for set: {ext}", fg="red", err=True
             )
             ctx.exit(1)
-    except FileNotFoundError:
-        # Should be caught above, but handle defensively
+    except FileNotFoundError:  # pragma: no cover
+        # I-16: defensive only. The pre-check above (``os.path.exists``)
+        # rules out the path-does-not-exist case at call-entry time;
+        # only a TOCTOU race against an external process deleting the
+        # file in the gap between the check and the open would reach
+        # this handler. Kept for safety.
         click.secho(f"Error: Config file disappeared: {fp}", fg="red", err=True)
         ctx.exit(1)
     except (tomli.TOMLDecodeError, json.JSONDecodeError) as e:
         click.secho(f"Error reading config file {fp}: {e}", fg="red", err=True)
         ctx.exit(1)
-    except Exception as e:  # Catch other read errors
+    except Exception as e:  # pragma: no cover
+        # I-16: catch-all for unanticipated read errors (permission
+        # denied flipping mid-load, I/O error on the underlying device,
+        # etc.). Specific decode errors are caught above.
         click.secho(f"Error loading file {fp} for update: {e}", fg="red", err=True)
         ctx.exit(1)
 
@@ -266,7 +396,12 @@ def set(ctx, key, value):
     # Set the value in the loaded data structure using dot notation helper
     try:
         set_by_dot(data, key, parsed_value)
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
+        # I-16: ``set_by_dot`` with the default ``create_missing=False``
+        # can raise :class:`KeyError` on a missing path, but the
+        # ``set`` command builds intermediate dicts via the helper's
+        # own logic, so a structural conflict from user input would
+        # land here. Kept defensively for visibility.
         click.secho(f"Error setting key '{key}': {e}", fg="red", err=True)
         ctx.exit(1)
 
@@ -279,7 +414,10 @@ def set(ctx, key, value):
         elif ext == ".json":
             with open(fp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)  # Keep pretty printing for JSON
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
+        # I-16: write-side I/O errors (disk full, permission denied,
+        # path no longer writable). These are environment-dependent
+        # and not exercised by the unit test suite.
         click.secho(f"Error writing updated config to {fp}: {e}", fg="red", err=True)
         ctx.exit(1)
 
@@ -310,18 +448,63 @@ def exists(ctx, key):
     default=False,
     help="Make key/value pattern matching case-insensitive.",
 )
+@click.option(
+    "--regex",
+    "force_regex",
+    is_flag=True,
+    default=False,
+    help=(
+        "Force regex matching for --key/--val patterns (overrides "
+        "auto-detection). Mutually exclusive with --glob and --exact."
+    ),
+)
+@click.option(
+    "--glob",
+    "force_glob",
+    is_flag=True,
+    default=False,
+    help=(
+        "Force glob (fnmatch) matching. Mutually exclusive with --regex and --exact."
+    ),
+)
+@click.option(
+    "--exact",
+    "force_exact",
+    is_flag=True,
+    default=False,
+    help=("Force exact string matching. Mutually exclusive with --regex and --glob."),
+)
 @click.pass_context
-def search(ctx, key_pat, val_pat, ignore_case):
+def search(ctx, key_pat, val_pat, ignore_case, force_regex, force_glob, force_exact):
     """
     Search for keys/values matching patterns in the final config.
     At least one of --key or --val must be provided.
-    Patterns can be plain text, glob (*?), or regex.
+    Patterns can be plain text, glob (*?), or regex. Use --regex,
+    --glob, or --exact to force a specific match mode (I-08).
     """
     if not (key_pat or val_pat):
         click.secho(
             "Error: Please supply --key and/or --val pattern.", fg="red", err=True
         )
         ctx.exit(1)
+
+    # I-08: resolve mutually-exclusive mode flags.
+    mode_flags = [force_regex, force_glob, force_exact]
+    if sum(mode_flags) > 1:
+        click.secho(
+            "Error: --regex, --glob, and --exact are mutually exclusive.",
+            fg="red",
+            err=True,
+        )
+        ctx.exit(1)
+    if force_regex:
+        match_mode = "regex"
+    elif force_glob:
+        match_mode = "glob"
+    elif force_exact:
+        match_mode = "exact"
+    else:
+        match_mode = "auto"
 
     # Flatten the final Config object (which might include nested Configs)
     flat_config = _flatten(ctx.obj["cfg"])
@@ -333,12 +516,12 @@ def search(ctx, key_pat, val_pat, ignore_case):
 
         # Check key pattern if provided
         if key_pat:
-            key_match = _match(key_pat, k, ignore_case)
+            key_match = _match(key_pat, k, ignore_case, mode=match_mode)
 
         # Check value pattern if provided and key matched (or no key pattern)
         if val_pat and key_match:
             # Convert value to string for matching
-            val_match = _match(val_pat, str(v), ignore_case)
+            val_match = _match(val_pat, str(v), ignore_case, mode=match_mode)
 
         # If both relevant patterns match, add to results
         if key_match and val_match:
@@ -384,7 +567,12 @@ def convert(ctx, fmt, out_file):
             output_text = tomli_w.dumps(data)
         else:  # fmt == "json"
             output_text = json.dumps(data, indent=2)
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
+        # I-17: defensive only. ``json.dumps`` and ``tomli_w.dumps`` can
+        # in principle raise on non-serializable values (e.g. live
+        # objects), but the in-memory config that lands here has
+        # already been deep-merged and contains only plain Python
+        # scalars / containers.
         click.secho(f"Error converting config data to {fmt}: {e}", fg="red", err=True)
         ctx.exit(1)
 
@@ -399,7 +587,10 @@ def convert(ctx, fmt, out_file):
             with open(out_file, mode=mode, encoding=encoding) as f:
                 f.write(output_text)
             click.secho(f"Wrote {fmt.upper()} output to {out_file}", fg="green")
-        except Exception as e:
+        except Exception as e:  # pragma: no cover
+            # I-17: write-side I/O failures (disk full, permission
+            # denied, path no longer writable). Environment-dependent
+            # and not covered by the unit test suite.
             click.secho(
                 f"Error writing output to file {out_file}: {e}", fg="red", err=True
             )
@@ -433,7 +624,7 @@ def provenance(ctx, key):
             err=True,
         )
         ctx.exit(1)
-        return
+        return  # pragma: no cover  -- unreachable; ctx.exit raises
 
     if key:
         history = cfg.provenance_history(key)

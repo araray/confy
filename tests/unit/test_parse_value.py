@@ -137,24 +137,55 @@ class TestFloats:
         assert isinstance(result, float)
         assert result == pytest.approx(expected)
 
-    @pytest.mark.parametrize("raw", ["inf", "Infinity", "INF", "-inf", "-Infinity"])
-    def test_infinity_accepted(self, raw: str) -> None:
-        """Pinned behavior: Python's :func:`float` accepts ``inf`` /
-        ``Infinity``, and we inherit that. If we ever decide to reject it,
-        this test must be updated deliberately.
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "inf",
+            "Infinity",
+            "INF",
+            "-inf",
+            "-Infinity",
+            "+inf",
+            "+Infinity",
+        ],
+    )
+    def test_infinity_rejected_falls_back_to_string(self, raw: str) -> None:
+        """I-06: Python's :func:`float` would accept ``inf`` / ``Infinity``
+        and produce ``math.inf``, but end users supplying configuration
+        values almost never mean the IEEE 754 special token. We
+        explicitly guard against those tokens and let the parser fall
+        through to the JSON / string-fallback branches, so the raw
+        string is preserved verbatim.
         """
         result = _parse_value(raw)
-        assert isinstance(result, float)
-        assert math.isinf(result)
+        assert isinstance(result, str)
+        # The fallback returns the *original* value (with whitespace, if any)
+        # so it round-trips losslessly:
+        assert result == raw
 
-    @pytest.mark.parametrize("raw", ["nan", "NaN", "NAN"])
-    def test_nan_accepted(self, raw: str) -> None:
-        """Pinned behavior: ``nan`` is accepted as a float (NaN). Same caveat
-        as :meth:`test_infinity_accepted`.
+    @pytest.mark.parametrize("raw", ["nan", "NaN", "NAN", "-nan", "+nan"])
+    def test_nan_rejected_falls_back_to_string(self, raw: str) -> None:
+        """I-06: same as :meth:`test_infinity_rejected_falls_back_to_string`
+        but for the NaN tokens. The raw string is kept.
         """
         result = _parse_value(raw)
-        assert isinstance(result, float)
-        assert math.isnan(result)
+        assert isinstance(result, str)
+        assert result == raw
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("  inf  ", "  inf  "),  # whitespace preserved in fallback
+            ("  nan  ", "  nan  "),
+        ],
+    )
+    def test_inf_nan_with_whitespace_round_trip(self, raw: str, expected: str) -> None:
+        """Whitespace-padded inf/nan tokens also fall through; per the
+        documented asymmetry the fallback returns the *original* raw
+        string, not the stripped form.
+        """
+        result = _parse_value(raw)
+        assert result == expected
 
 
 # ---------------------------------------------------------------------------

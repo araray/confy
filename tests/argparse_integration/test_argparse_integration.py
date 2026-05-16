@@ -188,21 +188,36 @@ class TestLoadConfigFromArgsOverrides:
         cfg = load_config_from_args()
         assert cfg.k == 42
 
-    def test_overrides_malformed_pair_silently_skipped(self, monkeypatch) -> None:
-        """A pair without a colon is silently dropped — unlike the
-        Click CLI which warns. This is the documented quieter
-        behavior of the argparse shim.
+    def test_overrides_malformed_pair_warns_and_skips(self, monkeypatch) -> None:
+        """A pair without a colon emits a :class:`UserWarning` and is
+        skipped (I-07: parity with the Click CLI's yellow warning on
+        stderr).
         """
+        import warnings
+
         monkeypatch.setattr(
             "sys.argv",
             ["prog", "--overrides", "good:1,bad_no_colon,also:2"],
         )
-        cfg = load_config_from_args()
-        # The good pairs are processed:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            cfg = load_config_from_args()
+        # The good pairs are still processed:
         assert cfg.good == 1
         assert cfg.also == 2
-        # The bad pair is dropped (not present, no error raised):
+        # The bad pair is dropped (not present, no exception raised):
         assert "bad_no_colon" not in cfg
+        # Exactly one warning fired, naming the offending pair:
+        malformed = [
+            w
+            for w in captured
+            if issubclass(w.category, UserWarning) and "bad_no_colon" in str(w.message)
+        ]
+        assert len(malformed) == 1
+        # Message names the option and the format hint:
+        assert "key:json_value" in str(malformed[0].message).lower() or (
+            "format" in str(malformed[0].message).lower()
+        )
 
     def test_overrides_empty_value_kept_as_empty_string(self, monkeypatch) -> None:
         monkeypatch.setattr("sys.argv", ["prog", "--overrides", "k:"])
@@ -240,21 +255,21 @@ class TestLoadConfigFromArgsFullChain:
         assert cfg.k == "from_overrides"
 
     def test_disjoint_keys_all_survive(self, monkeypatch, tmp_path) -> None:
-        """Each source contributes a unique single-segment key; every
-        one survives in the merged config.
+        """Each source contributes a unique key; every one survives in
+        the merged config.
 
-        We use **single-segment env-var names** (no underscores) to
-        avoid the load-dotenv-mode-vs-direct-env-mode fallback
-        ambiguity: when ``load_dotenv_file=True`` (the default, which
-        the argparse helper uses), an env var like ``MYAPP_ENV_ONLY``
-        falls back to nested form ``env.only`` rather than flat
-        ``env_only``. Pinning that quirk is left to dedicated
-        ``_remap_and_flatten_env_data`` unit tests; here we just want
-        to verify each source contributes.
+        Post-I-05 the argparse helper passes ``env_remap_fallback="flat"``
+        unconditionally, which makes the env-var path
+        ``MYAPP_ENV_ONLY`` deterministically collapse to ``env_only``
+        (no more dotenv-mode vs direct-env-mode ambiguity that
+        previously forced this test to use single-segment env-var
+        names to avoid the surprise).
         """
         cfg_file = tmp_path / "c.json"
         cfg_file.write_text(json.dumps({"fileonly": "f"}))
-        monkeypatch.setenv("MYAPP_ENVONLY", "e")  # single segment
+        # Multi-segment env-var name — the explicit "flat" fallback
+        # guarantees the result is the underscore-joined leaf key:
+        monkeypatch.setenv("MYAPP_ENV_ONLY", "e")
         monkeypatch.setattr(
             "sys.argv",
             [
@@ -270,7 +285,10 @@ class TestLoadConfigFromArgsFullChain:
         cfg = load_config_from_args(defaults={"defaultonly": "d"})
         assert cfg.defaultonly == "d"
         assert cfg.fileonly == "f"
-        assert cfg.envonly == "e"
+        # Flat fallback: ``MYAPP_ENV_ONLY`` → ``env_only`` (NOT
+        # ``env.only`` as it would have been under the old auto-dotenv
+        # rule).
+        assert cfg.env_only == "e"
         assert cfg.overrideonly == "o"
 
 

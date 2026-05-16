@@ -317,13 +317,38 @@ def _parse_value(raw_value: Any) -> Any:
         return result
     except ValueError:
         # If not int, attempt to parse as float
-        try:
-            result = float(stripped_val)
-            # log.debug(f"DEBUG [_parse_value]: Parsed as {result} (float)")
-            return result
-        except ValueError:
-            # If not a simple number, proceed to JSON check
+        # I-06: Python's ``float()`` accepts the IEEE 754 special tokens
+        # ``inf``, ``-inf``, ``+inf``, ``infinity`` (and case variants),
+        # and ``nan``. End users supplying configuration values rarely
+        # mean those — a user writing ``MYAPP_TIMEOUT=inf`` almost
+        # always wants the literal three-character string. We guard
+        # against those tokens here so they fall through to the JSON /
+        # string-fallback branches and ultimately round-trip as the
+        # original string. JSON's number production explicitly excludes
+        # these tokens for the same reason.
+        _FLOAT_SPECIAL_REJECT = (
+            "inf",
+            "-inf",
+            "+inf",
+            "infinity",
+            "-infinity",
+            "+infinity",
+            "nan",
+            "-nan",
+            "+nan",
+        )
+        if stripped_val.lower() in _FLOAT_SPECIAL_REJECT:
+            # Skip the ``float()`` attempt entirely; fall through to JSON
+            # / string-fallback below.
             pass
+        else:
+            try:
+                result = float(stripped_val)
+                # log.debug(f"DEBUG [_parse_value]: Parsed as {result} (float)")
+                return result
+            except ValueError:
+                # If not a simple number, proceed to JSON check
+                pass
 
     # Attempt to parse as JSON, but only if it looks like JSON
     # (starts with '{', '[', or '"' for quoted strings)
@@ -397,6 +422,19 @@ class Config(dict[str, Any]):
         # --- .env File Handling ---
         load_dotenv_file: bool = True,  # Whether to search for and load a .env file
         dotenv_path: str | None = None,  # Explicit path to a .env file
+        # --- Env-var remapping fallback (I-05) ---
+        # When an env-var key cannot be remapped against defaults/file
+        # structure, this controls the fallback shape:
+        #   "auto"   — preserve historical behavior (tied to
+        #              ``load_dotenv_file``): nested when True, flat when
+        #              False. This is the default for backward
+        #              compatibility.
+        #   "nested" — always preserve the dot form (e.g. ``env.only``).
+        #   "flat"   — always collapse to underscore form (e.g.
+        #              ``env_only``). Best for callers that don't want
+        #              the behavior of ``load_dotenv_file`` to silently
+        #              change the structure of unmatched env vars.
+        env_remap_fallback: str = "auto",
         # --- Multi-File & App Collections (Phase 1) ---
         file_paths: list[Union[str, tuple[str, str]]] | None = None,
         app_defaults: dict[str, dict[str, Any]] | None = None,
@@ -407,9 +445,16 @@ class Config(dict[str, Any]):
         *args,  # Allow initializing with a dictionary, e.g., Config({'a': 1})
         **kwargs,
     ):  # Allow initializing with keyword args, e.g., Config(a=1)
+        # Validate env_remap_fallback up front for a clear error.
+        if env_remap_fallback not in ("auto", "nested", "flat"):
+            raise ValueError(
+                f"env_remap_fallback must be one of 'auto', 'nested', 'flat' "
+                f"(got {env_remap_fallback!r})"
+            )
         # Store internal state
         self._prefix = prefix
         self._load_dotenv_file = load_dotenv_file
+        self._env_remap_fallback = env_remap_fallback
         self._app_prefixes = app_prefixes or {}
         self._track_provenance = track_provenance
         self._provenance = ProvenanceStore() if track_provenance else None
@@ -565,6 +610,7 @@ class Config(dict[str, Any]):
                 copy.deepcopy(file_data),
                 self._prefix,  # Pass prefix
                 self._load_dotenv_file,  # Pass load_dotenv_file flag
+                self._env_remap_fallback,  # I-05: explicit fallback strategy
             )
             log.debug(
                 f"DEBUG [confy.__init__]: Flat remapped env data: {flat_remapped_env_data}"
@@ -606,6 +652,7 @@ class Config(dict[str, Any]):
                         else {},
                         app_prefix,
                         self._load_dotenv_file,
+                        self._env_remap_fallback,  # I-05
                     )
                     structured = self._structure_overrides(flat_remapped)
 
@@ -658,44 +705,116 @@ class Config(dict[str, Any]):
         log.debug("DEBUG [confy.__init__]: Config initialization complete.")
 
     def _load_dotenv_file_action(self, dotenv_path: str | None):  # Renamed method
-        """Loads .env file into os.environ if python-dotenv is available."""
+        """Load a .env file into ``os.environ`` if python-dotenv is available.
+
+        This method is the public entry point. Internally it splits the
+        work into two small helpers (I-10 refactor) so each step is
+        independently testable:
+
+        1. :meth:`_resolve_dotenv_path` — figure out which path to use
+           (explicit ``dotenv_path`` argument vs. the result of
+           :func:`find_dotenv` for auto-discovery), and check whether
+           the file exists.
+        2. :meth:`_invoke_dotenv_loader` — call :func:`load_dotenv` on
+           the resolved path, swallow expected exceptions, and emit
+           debug/warning log lines.
+
+        Args:
+            dotenv_path: Explicit path supplied by the caller, or
+                ``None`` to auto-discover via :func:`find_dotenv`.
+        """
         if not load_dotenv:
-            effective_dotenv_path = dotenv_path or ".env"
-            exists = False
-            try:
-                if not dotenv_path and find_dotenv:
-                    effective_dotenv_path = (
-                        find_dotenv(usecwd=True) or effective_dotenv_path
-                    )
-                exists = os.path.exists(effective_dotenv_path)
-            except Exception:
-                pass
-            if exists:
-                log.warning(
-                    "Warning: python-dotenv not installed, cannot load .env file found at %s.",
-                    effective_dotenv_path,
-                )
+            # Special path: python-dotenv is not installed. Still report
+            # whether a .env was discoverable so users get a clear
+            # warning instead of silent omission.
+            self._warn_dotenv_missing(dotenv_path)
             return
 
+        resolved, exists = self._resolve_dotenv_path(dotenv_path)
+        if not exists or resolved is None:
+            return
+        self._invoke_dotenv_loader(resolved)
+
+    def _warn_dotenv_missing(self, dotenv_path: str | None) -> None:
+        """Emit a warning if a .env file is discoverable but
+        :mod:`python-dotenv` is not installed (so we cannot load it).
+
+        I-10 helper. Isolated so the "missing library" path is testable
+        without exercising the loader itself.
+        """
+        effective = dotenv_path or ".env"
+        exists = False
         try:
-            actual_dotenv_path = dotenv_path or (
-                find_dotenv(usecwd=True) if find_dotenv else None
-            )
-            if actual_dotenv_path and os.path.exists(actual_dotenv_path):
-                dotenv_was_loaded = load_dotenv(
-                    dotenv_path=actual_dotenv_path, override=False
-                )
-                if dotenv_was_loaded:
-                    log.debug(
-                        f"DEBUG [confy._load_dotenv_file_action]: Loaded .env file from: {actual_dotenv_path}."
-                    )
-                else:
-                    log.debug(
-                        f"DEBUG [confy._load_dotenv_file_action]: .env file found at {actual_dotenv_path} but did not load (all variables might already exist in env)."
-                    )
-        except Exception as e:
+            if not dotenv_path and find_dotenv:
+                effective = find_dotenv(usecwd=True) or effective
+            exists = os.path.exists(effective)
+        except Exception:  # pragma: no cover
+            # Defensive against odd filesystem errors during discovery;
+            # absence of a .env is not an error.
+            pass
+        if exists:
             log.warning(
-                f"Warning: Failed during .env file loading (path: {dotenv_path or 'auto'}): {e}"
+                "Warning: python-dotenv not installed, cannot load .env file found at %s.",
+                effective,
+            )
+
+    @staticmethod
+    def _resolve_dotenv_path(
+        dotenv_path: str | None,
+    ) -> tuple[str | None, bool]:
+        """Resolve the path to load and whether it exists on disk.
+
+        I-10 helper. Pure(ish) resolution step:
+        * If ``dotenv_path`` is supplied, use it as-is.
+        * Otherwise, fall back to :func:`find_dotenv` (when available)
+          to walk up from CWD looking for ``.env``.
+        * Returns ``(path_or_None, exists_bool)``.
+
+        Args:
+            dotenv_path: User-supplied path, or ``None`` for
+                auto-discovery.
+
+        Returns:
+            Tuple of the resolved path (``None`` if neither was
+            supplied nor discovered) and a boolean indicating whether
+            it actually exists on disk.
+        """
+        resolved = dotenv_path or (find_dotenv(usecwd=True) if find_dotenv else None)
+        if resolved and os.path.exists(resolved):
+            return resolved, True
+        return resolved, False
+
+    def _invoke_dotenv_loader(self, resolved_path: str) -> None:
+        """Call :func:`load_dotenv` on ``resolved_path`` with
+        ``override=False`` and log whether anything was injected.
+
+        I-10 helper. ``override=False`` preserves the convention that
+        explicit ``os.environ`` settings take precedence over .env file
+        entries (so a user running ``MYAPP_HOST=x my_program`` gets
+        their CLI override even with a stale .env on disk).
+
+        Args:
+            resolved_path: Path to the .env file. Caller ensures it
+                exists.
+        """
+        try:
+            dotenv_was_loaded = load_dotenv(dotenv_path=resolved_path, override=False)
+            if dotenv_was_loaded:
+                log.debug(
+                    f"DEBUG [confy._load_dotenv_file_action]: Loaded .env file from: {resolved_path}."
+                )
+            else:
+                log.debug(
+                    f"DEBUG [confy._load_dotenv_file_action]: .env file found at {resolved_path} but did not load (all variables might already exist in env)."
+                )
+        except Exception as e:  # pragma: no cover
+            # Defensive: python-dotenv shouldn't raise on a well-formed
+            # path that exists, but unexpected I/O errors (permission
+            # denied, mount lost mid-load) shouldn't crash the whole
+            # Config build — log and continue with whatever was already
+            # in os.environ.
+            log.warning(
+                f"Warning: Failed during .env file loading (path: {resolved_path}): {e}"
             )
 
     @staticmethod
@@ -960,7 +1079,14 @@ class Config(dict[str, Any]):
                 try:
                     set_by_dot(env_data, dot_key, val, create_missing=True)
                     applied_count += 1
-                except Exception as e:
+                except Exception as e:  # pragma: no cover
+                    # I-13: defensive only. With ``create_missing=True``
+                    # the path is unconditionally created (intermediate
+                    # dicts are spawned on the fly), so ``set_by_dot``
+                    # cannot raise on a missing path. The only realistic
+                    # raise path would be a non-string key in ``dot_key``,
+                    # which is unreachable because ``dot_key`` is built
+                    # from the (string) env-var name.
                     log.error(
                         f"Error processing environment variable '{var}' (key: '{dot_key}') into structure: {e}"
                     )
@@ -976,6 +1102,7 @@ class Config(dict[str, Any]):
         file_data: dict[str, Any],
         prefix: str | None,
         load_dotenv_file: bool,
+        env_remap_fallback: str = "auto",
     ) -> dict[str, Any]:
         """
         Remaps and flattens environment variable keys based on defaults/file structure.
@@ -987,6 +1114,10 @@ class Config(dict[str, Any]):
             file_data: The dictionary loaded from the config file.
             prefix: The prefix used for environment variables.
             load_dotenv_file: Flag indicating if .env file loading was attempted.
+            env_remap_fallback: Explicit fallback strategy when no remap target
+                is found ("auto" preserves historical behavior tied to
+                ``load_dotenv_file``; "nested" / "flat" force the choice).
+                See :class:`Config` for the full discussion.
 
         Returns:
             A flat dictionary with remapped dot-notation keys ready for structuring.
@@ -1026,48 +1157,80 @@ class Config(dict[str, Any]):
             parts = dot_key.split(".")
             remapped_key = None
 
-            # --- BEGIN FIX ---
-            # Heuristic 0: Handle base keys that themselves contain underscores
-            # e.g., dot_key = "feature.flags.beta.feature" from MYAPP_FEATURE_FLAGS_BETA_FEATURE
-            #       valid_base_keys contains "feature_flags.beta_feature"
-            # We need to map "feature.flags.beta.feature" -> "feature_flags.beta_feature"
+            # --- BEGIN FIX (I-01) ---
+            # Heuristic 0: Handle base keys that themselves contain underscores.
+            # e.g., dot_key = "feature.flags.beta.feature" from
+            #                 MYAPP_FEATURE_FLAGS_BETA_FEATURE
+            # valid_base_keys may contain "feature_flags" (a dict). We want to
+            # remap to "feature_flags.beta_feature".
+            #
+            # Strategy: iterate over EVERY underscore boundary in the
+            # reconstructed underscore-form of the key, from the longest
+            # candidate prefix downward. The first prefix that exists as a
+            # *dict* in the base config wins. Joining the prefix with the
+            # remainder using a single dot (and the remainder kept in its
+            # underscore form) yields the final remapped key.
+            #
+            # This fixes the previous "split on FIRST underscore only" bug
+            # that prevented base keys with underscores from being matched
+            # when the env-var path had more than two segments
+            # (see CONTRIBUTING.md §6.1).
             reconstructed_flat = dot_key.replace(
                 ".", "_"
             )  # -> "feature_flags_beta_feature"
-            if "_" in reconstructed_flat:
-                # Split only on the *first* underscore to find potential base key
-                root, rest = reconstructed_flat.split(
-                    "_", 1
-                )  # -> ("feature_flags", "beta_feature")
-                candidate = f"{root}.{rest}"  # -> "feature_flags.beta_feature"
-                if candidate in valid_base_keys:
-                    remapped_key = candidate
-                    log.debug(
-                        f"Heuristic remapping '{dot_key}' -> '{remapped_key}' "
-                        "based on underscore-containing base key."
-                    )
-                    # If heuristic matches, use it and skip other attempts
-                    if remapped_key not in flat_remapped_env_data:
-                        flat_remapped_env_data[remapped_key] = value
-                        log.debug(
-                            f"Added to flat remapped data (heuristic): '{remapped_key}': {value!r}"
-                        )
-                    else:
-                        log.warning(
-                            f"Skipping assignment for '{dot_key}' -> '{remapped_key}' (heuristic) as target key already set."
-                        )
-                    continue  # Go to the next env var item
+            underscore_positions = [
+                i for i, c in enumerate(reconstructed_flat) if c == "_"
+            ]
+            heuristic_match: str | None = None
+            # Iterate from rightmost underscore (longest prefix) to leftmost
+            # (shortest prefix). The first prefix that resolves to a dict in
+            # base wins (most-specific base key).
+            for split_idx in reversed(underscore_positions):
+                prefix_flat = reconstructed_flat[:split_idx]
+                rest_flat = reconstructed_flat[split_idx + 1 :]
+                if not prefix_flat or not rest_flat:
+                    continue  # pragma: no cover (empty halves can't happen when split_idx is a real underscore position)
+                if prefix_flat not in valid_base_keys:
+                    continue
+                try:
+                    target_in_base = get_by_dot(base_config_check, prefix_flat)
+                except (KeyError, TypeError):  # pragma: no cover
+                    # Should not happen when prefix_flat is in valid_base_keys.
+                    continue
+                if isinstance(target_in_base, dict):
+                    heuristic_match = f"{prefix_flat}.{rest_flat}"
+                    break
 
-            # Attempt 1: Check if the key reconstructed with underscores exists in base config
-            # (Original logic, now Attempt 1) - Use reconstructed_flat from above
+            if heuristic_match is not None:
+                remapped_key = heuristic_match
+                log.debug(
+                    f"Heuristic remapping '{dot_key}' -> '{remapped_key}' "
+                    "based on underscore-containing base key."
+                )
+                # If heuristic matches, use it and skip other attempts.
+                if remapped_key not in flat_remapped_env_data:
+                    flat_remapped_env_data[remapped_key] = value
+                    log.debug(
+                        f"Added to flat remapped data (heuristic): '{remapped_key}': {value!r}"
+                    )
+                else:
+                    log.warning(
+                        f"Skipping assignment for '{dot_key}' -> '{remapped_key}' (heuristic) as target key already set."
+                    )
+                continue  # Go to the next env var item
+
+            # Attempt 1: Check if the key reconstructed with underscores
+            # exists as a *flat* key in the base config (no nesting).
             if reconstructed_flat in valid_base_keys:
                 remapped_key = reconstructed_flat
                 log.debug(
                     f"Remapping '{dot_key}' to existing exact base config key '{remapped_key}'."
                 )
 
-            # Attempt 2: If not found, try finding the longest prefix that matches a base config key
-            # (Original logic, now Attempt 2)
+            # Attempt 2: If not found, try finding the longest dot-prefix that
+            # matches a base config key. This handles cases where the env-var
+            # path uses single underscores throughout but the base structure
+            # is purely nested (no underscores in keys), e.g. base ``db.x``.
             if not remapped_key:
                 for i in range(len(parts) - 1, 0, -1):
                     potential_root_key = ".".join(parts[:i])
@@ -1090,37 +1253,48 @@ class Config(dict[str, Any]):
                                     f"Remapping '{dot_key}' to '{remapped_key}' based on existing base config dict key '{potential_root_key}'."
                                 )
                                 break  # Found the longest matching prefix
-                        except (KeyError, TypeError):
-                            pass  # Should not happen if key is in valid_base_keys, but check defensively
-            # --- END FIX ---
+                        except (KeyError, TypeError):  # pragma: no cover
+                            # Should not happen if key is in valid_base_keys,
+                            # but check defensively (I-11).
+                            pass
+            # --- END FIX (I-01) ---
 
             # --- Determine final key ---
             if remapped_key:
                 # We found a remapping based on defaults/file structure
                 final_key = remapped_key
             else:
-                # --- Apply context-aware fallback logic ---
-                if prefix == "":
-                    # Empty-prefix: treat every original underscore as a nesting dot.
+                # --- Apply fallback logic (I-05) ---
+                # Resolve "auto" to a concrete mode using the historical
+                # rule: empty-prefix → nested; otherwise tied to
+                # ``load_dotenv_file``. Explicit "nested" / "flat" bypass
+                # this entirely.
+                if env_remap_fallback == "nested":
+                    effective_mode = "nested"
+                elif env_remap_fallback == "flat":
+                    effective_mode = "flat"
+                else:  # "auto"
+                    if prefix == "":
+                        effective_mode = "nested"
+                    elif load_dotenv_file:
+                        effective_mode = "nested"
+                    else:
+                        effective_mode = "flat"
+
+                if effective_mode == "nested":
+                    # Preserve every original underscore as a nesting dot.
                     final_key = dot_key
                     log.debug(
-                        f"No remap target for '{dot_key}' (empty prefix). Falling back to '{final_key}'."
+                        f"No remap target for '{dot_key}'. "
+                        f"Falling back (nested) to '{final_key}'."
                     )
-                else:
-                    # Prefix is not empty
-                    if load_dotenv_file:
-                        # .env-loaded variables: Use the original dot_key directly if no remap found.
-                        final_key = dot_key
-                        log.debug(
-                            f"No remap target for '{dot_key}' (.env mode). Falling back to original dot key: '{final_key}'."
-                        )
-                    else:
-                        # Real env vars (no-dotenv): preserve all original underscores as one flat key
-                        # Reconstruct by replacing dots back to underscores
-                        final_key = dot_key.replace(".", "_")  # e.g., added_by_env
-                        log.debug(
-                            f"No remap target for '{dot_key}' (direct env mode). Falling back to flat key: '{final_key}'."
-                        )
+                else:  # "flat"
+                    # Collapse to a single underscore-joined flat key.
+                    final_key = dot_key.replace(".", "_")
+                    log.debug(
+                        f"No remap target for '{dot_key}'. "
+                        f"Falling back (flat) to '{final_key}'."
+                    )
 
             # --- Add to the flat output dictionary ---
             # Check for conflicts: If final_key already exists, the deeper key (processed first) wins.
@@ -1179,7 +1353,15 @@ class Config(dict[str, Any]):
                 parsed_val = _parse_value(raw_val)
                 # Use create_missing=True for overrides
                 set_by_dot(structured_overrides, key, parsed_val, create_missing=True)
-            except Exception as e:
+            except Exception as e:  # pragma: no cover
+                # I-12: defensive only. ``_parse_value`` is exhaustively
+                # try/except'd internally and ``set_by_dot`` with
+                # ``create_missing=True`` is path-safe, so no realistic
+                # input reaches this handler. Kept for forward
+                # compatibility (a future refactor that lets
+                # ``set_by_dot`` raise on a structural conflict should
+                # surface here as an error log rather than crashing the
+                # whole load).
                 log.error(f"Error processing override key '{key}': {e}")
 
         # Return deepcopy to prevent modification of input dict (though structure is new)

@@ -73,8 +73,14 @@ class TestSearchGlob:
         assert set(parsed.keys()) == {"a", "b", "c"}
 
     def test_glob_case_insensitive_by_default(self, runner, json_config) -> None:
-        """fnmatch in confy's ``_match`` lowercases both sides, so glob
-        is always case-insensitive regardless of ``-i``.
+        """fnmatch in confy's ``_match`` lowercases both sides under
+        AUTO mode (default), so glob is always case-insensitive
+        regardless of ``-i``.
+
+        I-09 resolution: this auto-mode quirk is preserved for
+        backward compatibility. Users who want case-sensitive glob
+        matching can opt in via the new ``--glob`` explicit flag
+        (see :class:`TestSearchExplicitMode.test_force_glob_case_sensitive_by_default`).
         """
         fp = json_config({"DB_HOST": "x"})
         result = runner.invoke(cli, ["-c", fp, "search", "--key", "db*"])
@@ -267,3 +273,130 @@ class TestSearchErrors:
         result = runner.invoke(cli, ["-c", fp, "search", "--key", "zzz_does_not_exist"])
         assert result.exit_code == 1
         assert "no matches" in result.stdout.lower()
+
+
+# =============================================================================
+# I-08 — Explicit --regex / --glob / --exact mode flags
+# =============================================================================
+
+
+class TestSearchExplicitMode:
+    """The ``--regex``, ``--glob``, and ``--exact`` flags force a
+    specific match mode and bypass the auto-detection heuristic. This
+    is useful when the auto-detection guesses wrong (e.g., a pattern
+    that contains regex-special chars but should be matched literally,
+    or a plain word that should be treated as a regex).
+    """
+
+    # ---- --regex ----
+
+    def test_force_regex_on_plain_word(self, runner, json_config) -> None:
+        """Without ``--regex``, a plain word ``host`` would be exact-matched.
+        With ``--regex``, it becomes a substring regex.
+        """
+        fp = json_config({"db_host": "x", "host_alias": "y", "other": "z"})
+        result = runner.invoke(cli, ["-c", fp, "search", "--key", "host", "--regex"])
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        # Substring regex matches both keys containing 'host':
+        assert set(parsed.keys()) == {"db_host", "host_alias"}
+
+    def test_force_regex_invalid_pattern_gives_no_matches(
+        self, runner, json_config
+    ) -> None:
+        """Invalid regex syntax under explicit ``--regex`` produces no
+        matches (rather than silently degrading to substring like the
+        auto path would do).
+        """
+        fp = json_config({"a": 1})
+        result = runner.invoke(
+            cli, ["-c", fp, "search", "--key", "[unterminated", "--regex"]
+        )
+        assert result.exit_code == 1
+        assert "no matches" in result.stdout.lower()
+
+    # ---- --glob ----
+
+    def test_force_glob_case_sensitive_by_default(self, runner, json_config) -> None:
+        """Explicit ``--glob`` IS case-sensitive by default (unlike
+        auto-mode glob, which forces case-insensitive). I-09 fix: the
+        explicit flag exposes proper fnmatch semantics.
+        """
+        fp = json_config({"DB_HOST": "x", "db_host": "y"})
+        result = runner.invoke(cli, ["-c", fp, "search", "--key", "db*", "--glob"])
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        # Only the lowercase ``db_host`` matches the lowercase pattern:
+        assert "db_host" in parsed
+        assert "DB_HOST" not in parsed
+
+    def test_force_glob_with_ignore_case(self, runner, json_config) -> None:
+        """``--glob -i`` matches case-insensitively (like auto-mode)."""
+        fp = json_config({"DB_HOST": "x", "db_host": "y"})
+        result = runner.invoke(
+            cli, ["-c", fp, "search", "--key", "db*", "--glob", "-i"]
+        )
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        assert set(parsed.keys()) == {"DB_HOST", "db_host"}
+
+    # ---- --exact ----
+
+    def test_force_exact_with_regex_chars(self, runner, json_config) -> None:
+        """A pattern with regex-special chars is matched literally
+        under ``--exact``.
+        """
+        fp = json_config({"a.b": 1, "ab": 2, "aXb": 3})
+        result = runner.invoke(cli, ["-c", fp, "search", "--key", "a.b", "--exact"])
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        # Only the literal ``a.b`` matches — the regex-like ``.``
+        # is not interpreted:
+        assert parsed == {"a.b": 1}
+
+    def test_force_exact_case_sensitive_by_default(self, runner, json_config) -> None:
+        """``--exact`` is case-sensitive by default (unlike auto-mode
+        exact, which is case-insensitive).
+        """
+        fp = json_config({"Foo": 1, "foo": 2})
+        result = runner.invoke(cli, ["-c", fp, "search", "--key", "foo", "--exact"])
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        assert parsed == {"foo": 2}
+
+    def test_force_exact_with_ignore_case(self, runner, json_config) -> None:
+        fp = json_config({"Foo": 1, "foo": 2})
+        result = runner.invoke(
+            cli, ["-c", fp, "search", "--key", "foo", "--exact", "-i"]
+        )
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        assert set(parsed.keys()) == {"Foo", "foo"}
+
+    # ---- Mutual exclusivity ----
+
+    def test_mode_flags_are_mutually_exclusive(self, runner, json_config) -> None:
+        fp = json_config({"a": 1})
+        result = runner.invoke(
+            cli, ["-c", fp, "search", "--key", "a", "--regex", "--glob"]
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.stderr.lower()
+
+    def test_three_mode_flags_all_set_errors(self, runner, json_config) -> None:
+        fp = json_config({"a": 1})
+        result = runner.invoke(
+            cli,
+            [
+                "-c",
+                fp,
+                "search",
+                "--key",
+                "a",
+                "--regex",
+                "--glob",
+                "--exact",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.stderr.lower()

@@ -49,24 +49,6 @@ except ImportError:
 from confy.exceptions import MissingMandatoryConfig
 from confy.loader import Config, get_by_dot, set_by_dot
 
-# --- Known-bug quarantine -----------------------------------------------------
-# The four xfail-marked tests below all hit the same env-var remapping bug.
-# When (if) Heuristic 0 in confy.loader._remap_and_flatten_env_data is fixed
-# to perform a longest-base-key match instead of splitting on the first
-# underscore, these tests will start passing. ``strict=True`` will then turn
-# the XPASS into a hard failure, prompting removal of the xfail marker.
-# Do not relax ``strict=True`` without addressing the underlying bug.
-_KNOWN_ENV_REMAP_BUG = (
-    "Known bug in confy.loader._remap_and_flatten_env_data Heuristic 0: it "
-    "splits the reconstructed flat key on the FIRST underscore only, so an "
-    "env var like MYAPP_FEATURE_FLAGS_BETA_FEATURE (expected to remap to "
-    "'feature_flags.beta_feature' because 'feature_flags' is a known base "
-    "key) is probed as 'feature.flags_beta_feature' (not a base key) and "
-    "falls back to a flat top-level 'feature_flags_beta_feature'. Fixing it "
-    "requires iterating from the longest-prefix candidate downward, similar "
-    "to Attempt 2 but over reconstructed-flat candidates instead of dot ones."
-)
-
 # --- Fixtures ---
 
 
@@ -123,11 +105,15 @@ def dotenv_file_path(tmp_path):
     if not dotenv_available:
         pytest.skip("python-dotenv not installed")
     content = """
-# Sample .env file for testing
+# Sample .env file for testing.
+# Note: secrets is NOT in defaults_data, so we MUST use the documented
+# double-underscore (``__``) convention to disambiguate the literal
+# underscore in the leaf key name ``api_key`` (see the env-var mapping
+# rules at the top of confy/loader.py).
 MYAPP_DATABASE_USER="dotenv_user"
 MYAPP_LOGGING_FILE="/var/log/app.log"
 MYAPP_FEATURE_FLAGS_BETA_FEATURE=true
-MYAPP_SECRETS_API_KEY="dotenv_key_123"
+MYAPP_SECRETS_API__KEY="dotenv_key_123"
 EXISTING_VAR=dotenv_value
 OTHER_VAR=ignore_me
 MYAPP_DATABASE_PORT=5555
@@ -239,7 +225,6 @@ def test_load_toml_over_defaults(defaults_data, toml_cfg_path):
     assert isinstance(cfg.new_section, Config)
 
 
-@pytest.mark.xfail(strict=True, reason=_KNOWN_ENV_REMAP_BUG)
 def test_load_env_over_file_and_defaults(defaults_data, json_cfg_path, monkeypatch):
     """Test environment variables overriding file and defaults."""
     logging.debug("Running test_load_env_over_file_and_defaults")
@@ -283,7 +268,6 @@ def test_load_env_over_file_and_defaults(defaults_data, json_cfg_path, monkeypat
     assert isinstance(cfg.feature_flags, Config)
 
 
-@pytest.mark.xfail(strict=True, reason=_KNOWN_ENV_REMAP_BUG)
 def test_load_dotenv_implicitly(defaults_data, dotenv_file_path, monkeypatch):
     """Test implicit loading of .env file when found in current/parent dir."""
     if not dotenv_available:
@@ -297,7 +281,7 @@ def test_load_dotenv_implicitly(defaults_data, dotenv_file_path, monkeypatch):
         "MYAPP_LOGGING_FILE",
         "MYAPP_FEATURE_FLAGS_BETA_FEATURE",
         "MYAPP_FEATURE_FLAGS_NEW_UI",
-        "MYAPP_SECRETS_API_KEY",
+        "MYAPP_SECRETS_API__KEY",
         "EXISTING_VAR",
         "OTHER_VAR",
     )
@@ -330,7 +314,6 @@ def test_load_dotenv_implicitly(defaults_data, dotenv_file_path, monkeypatch):
     assert isinstance(cfg.secrets, Config)
 
 
-@pytest.mark.xfail(strict=True, reason=_KNOWN_ENV_REMAP_BUG)
 def test_load_dotenv_explicitly(defaults_data, dotenv_file_path, monkeypatch):
     """Test loading .env file from an explicit path."""
     if not dotenv_available:
@@ -344,7 +327,7 @@ def test_load_dotenv_explicitly(defaults_data, dotenv_file_path, monkeypatch):
         "MYAPP_LOGGING_FILE",
         "MYAPP_FEATURE_FLAGS_BETA_FEATURE",
         "MYAPP_FEATURE_FLAGS_NEW_UI",
-        "MYAPP_SECRETS_API_KEY",
+        "MYAPP_SECRETS_API__KEY",
     )
 
     # Initialize Config with prefix and explicit dotenv_path
@@ -377,7 +360,7 @@ def test_load_dotenv_disabled(defaults_data, dotenv_file_path, monkeypatch):
         "MYAPP_DATABASE_PORT",
         "MYAPP_LOGGING_FILE",
         "MYAPP_FEATURE_FLAGS_BETA_FEATURE",
-        "MYAPP_SECRETS_API_KEY",
+        "MYAPP_SECRETS_API__KEY",
     )
     # We might even set a conflicting env var manually to be sure .env isn't loaded later
     monkeypatch.setenv("SOME_OTHER_VAR", "test_value")
@@ -395,7 +378,6 @@ def test_load_dotenv_disabled(defaults_data, dotenv_file_path, monkeypatch):
     assert cfg.database.port == 5432  # Should be default
 
 
-@pytest.mark.xfail(strict=True, reason=_KNOWN_ENV_REMAP_BUG)
 def test_dotenv_does_not_override_existing_env(
     defaults_data, dotenv_file_path, monkeypatch
 ):
