@@ -702,46 +702,108 @@ except Exception as e:
 
 ## Testing
 
-A test suite using `pytest` is included in the `tests/` directory.
+`confy` ships with a comprehensive test suite layered by purpose: pure-function unit tests, multi-component integration tests, CLI tests via Click's `CliRunner`, and robustness tests for edge cases and missing optional dependencies. Total coverage sits at **~95.8%** (loader 98.3%, CLI 87.6%, argparse helper 100%).
 
-**Prerequisites:**
+### Quick run
 
-  - Install `pytest`: `pip install pytest`
-  - Install project dependencies (including `tomli`, `tomli-w`, `python-dotenv`, `click`): `pip install .` or `pip install -r requirements-dev.txt` (if available).
-
-**Running Tests:**
-
-Execute `pytest` from the root directory of the project:
+Install dev dependencies and run the full suite:
 
 ```bash
-pytest tests/
+pip install -e ".[dev]"
+pytest                                  # 733 passed, 4 xfailed in ~1.6 s
+pytest --cov=confy --cov-report=term-missing
 ```
 
-Or with more options:
+### Running a specific layer
+
+Each test layer is tagged with a [pytest marker](https://docs.pytest.org/en/stable/example/markers.html), declared in `pyproject.toml`:
 
 ```bash
-pytest --maxfail=1 --disable-warnings -q tests/
+pytest -m unit                          # pure-function unit tests (fastest)
+pytest -m integration                   # multi-component, file + env
+pytest -m cli                           # click CLI via CliRunner
+pytest -m robustness                    # malformed input + optional deps
 ```
 
-Please add tests for any new features or bug fixes you contribute. Ensure existing tests continue to pass.
+Marker selection composes: `pytest -m "unit or robustness"`.
+
+### Suite layout
+
+```
+tests/
+├── conftest.py                         # autouse env + cwd snapshot fixtures
+├── test_loader.py                      # legacy monolithic tests (4 xfail)
+├── v040/                               # v0.4.0 phase tests
+├── unit/                               # pure-function tests (P2 + P3)
+│   ├── test_parse_value.py
+│   ├── test_dot_path.py
+│   ├── test_deep_merge.py
+│   ├── test_utils.py
+│   ├── test_env_collect.py
+│   ├── test_env_remap.py
+│   ├── test_config_init_sources.py
+│   └── test_config_access.py
+├── integration/                        # end-to-end Config (P4)
+│   ├── test_precedence_matrix.py
+│   ├── test_dotenv_integration.py
+│   ├── test_multifile.py
+│   ├── test_app_namespaces.py
+│   ├── test_mandatory_validation.py
+│   └── test_round_trip.py
+├── cli/                                # Click CLI surface (P5)
+│   ├── conftest.py                     # CliRunner + config-file factories
+│   ├── test_cli_root.py
+│   ├── test_cli_get.py
+│   ├── test_cli_set.py
+│   ├── test_cli_exists.py
+│   ├── test_cli_dump.py
+│   ├── test_cli_search.py
+│   ├── test_cli_convert.py
+│   ├── test_cli_provenance.py
+│   ├── test_cli_overrides_parsing.py
+│   └── test_cli_defaults_loading.py
+├── argparse_integration/               # argparse helper (P6)
+│   └── test_argparse_integration.py
+└── robustness/                         # P6: defensive + edge
+    ├── test_optional_deps.py
+    ├── test_loader_branches.py
+    └── test_edge_cases.py
+```
+
+### Coverage gate
+
+`pyproject.toml` enforces a minimum of `fail_under = 90`. Drop below that and `pytest --cov=confy` exits with code 1. The actual achieved coverage (~95.8%) is well above the gate; the margin exists so a small, conscious regression doesn't immediately break CI while still catching unintended drops.
+
+### Known xfailed tests
+
+Four tests in `tests/test_loader.py` are marked `@pytest.mark.xfail(strict=True)` because they depend on a specific behavior of `_remap_and_flatten_env_data` (Heuristic 0 underscore handling) that doesn't work as expected for multi-underscore base keys. See [CONTRIBUTING.md](CONTRIBUTING.md#known-library-quirks) for the full list of documented quirks.
+
+### Adding new tests
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the test-organization conventions, available fixtures, and which marker to use for new tests.
 
 -----
 
 ## Contributing
 
-Contributions, bug reports, and feature requests are welcome\!
+Contributions, bug reports, and feature requests are welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide, which covers:
 
-1.  **Check for Existing Issues:** Look through the GitHub Issues to see if your suggestion or bug has already been reported.
-2.  **Fork the Repository:** Create your own copy of the repository on GitHub.
-3.  **Create a Feature Branch:** Base your work on the `main` branch (`git checkout -b feat/your-descriptive-feature-name main`). Use prefixes like `feat/`, `fix/`, `docs/`.
-4.  **Write Code & Tests:** Implement your changes and add corresponding tests in the `tests/` directory to verify functionality and prevent regressions.
-5.  **Ensure Tests Pass:** Run `pytest tests/` locally.
-6.  **Update Documentation:** Modify `README.md` and any relevant docstrings if your changes affect usage or add new features.
-7.  **Commit Changes:** Use clear and concise commit messages (e.g., `fix: Correctly handle empty environment variables`).
-8.  **Push to Your Fork:** `git push origin feat/your-descriptive-feature-name`.
-9.  **Open a Pull Request:** Submit a PR from your feature branch to the original repository's `main` branch. Clearly describe your changes and why they are needed.
+* Development setup and dev-dependency installation.
+* The test-suite organization (the unit / integration / cli / robustness layers).
+* Where to put new tests and which marker to use.
+* The autouse fixtures and what they protect against.
+* The full list of known library quirks (xfailed tests, parser edge cases, undocumented behaviors).
+* PR workflow and commit-message conventions.
 
-Please adhere to the existing code style (e.g., PEP 8) and ensure your contribution includes tests.
+In short:
+
+1. Fork → branch from `main` (e.g., `feat/short-description`).
+2. Write code AND tests.
+3. Run `pytest` locally; ensure the coverage gate (`fail_under=90`) holds.
+4. Update `README.md` or docstrings if the change affects usage.
+5. Open a PR against `main` with a clear summary of motivation and scope.
+
+Please adhere to PEP 8 and the existing code style. The project uses `basedpyright` for type checking and `ruff` for linting; running those locally before submitting is recommended.
 
 -----
 
