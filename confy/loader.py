@@ -1182,24 +1182,64 @@ class Config(dict[str, Any]):
                 i for i, c in enumerate(reconstructed_flat) if c == "_"
             ]
             heuristic_match: str | None = None
-            # Iterate from rightmost underscore (longest prefix) to leftmost
-            # (shortest prefix). The first prefix that resolves to a dict in
-            # base wins (most-specific base key).
-            for split_idx in reversed(underscore_positions):
-                prefix_flat = reconstructed_flat[:split_idx]
-                rest_flat = reconstructed_flat[split_idx + 1 :]
-                if not prefix_flat or not rest_flat:
-                    continue  # pragma: no cover (empty halves can't happen when split_idx is a real underscore position)
-                if prefix_flat not in valid_base_keys:
+            # --- rc6 patch (2^N enumeration with deepest-match-wins) ---
+            #
+            # Pre-rc6 the heuristic only split at one underscore position
+            # at a time (rightmost-first, first match wins) and so it
+            # could not disambiguate cases like the test
+            # ``test_disambiguation_prefers_deeper_match`` where both
+            # ``a_b.c`` and ``a.b.c`` are valid base paths and the env-var
+            # ``X_A_B_C`` is ambiguous between them.  Pre-rc6 the
+            # iteration found ``a_b`` first (rightmost split) and stopped,
+            # so the env override landed on ``a_b.c`` (depth 2) instead
+            # of ``a.b.c`` (depth 3).
+            #
+            # The rc6 patch enumerates ALL 2^N choices of "this
+            # underscore is a section separator (becomes ``.``) vs this
+            # underscore stays inside a key name", checks each candidate
+            # against ``valid_base_keys`` (the dot-form flattened keys of
+            # defaults+file), and picks the deepest (most dots in the
+            # final candidate).  Lexicographic tiebreak on equal depth
+            # for determinism.  This handles both the "section name has
+            # underscores" case and the "section name has no underscores
+            # but base path is more deeply nested" case uniformly.
+            #
+            # Cost: O(2^N) where N is the number of underscores in the
+            # reconstructed flat key.  In practice N <= 5 for any
+            # reasonable env-var name, so worst case is 32 candidate
+            # checks per env var, all in a set membership test.  Trivial.
+            #
+            # Tiebreak rule: when two candidates have the same number of
+            # dots (equal depth), prefer the one whose FIRST dot appears
+            # LATEST (= longest leading-underscore section name).  This
+            # is what the upstream confy
+            # ``TestHeuristic0LongestPrefix::test_longest_prefix_wins``
+            # test asserts: with defaults ``a_b.c`` and ``a.b_c`` both
+            # valid, env ``A_B_C`` lands at ``a_b.c`` (the section name
+            # ``a_b`` is more specific than the leaf split ``a.b_c``).
+            n_under = len(underscore_positions)
+            best_dots = -1
+            best_first_dot = -1  # higher = later = longer underscore prefix
+            for mask in range(1 << n_under):
+                chars = list(reconstructed_flat)
+                for bit, pos in enumerate(underscore_positions):
+                    if mask & (1 << bit):
+                        chars[pos] = "."
+                candidate = "".join(chars)
+                if candidate not in valid_base_keys:
                     continue
-                try:
-                    target_in_base = get_by_dot(base_config_check, prefix_flat)
-                except (KeyError, TypeError):  # pragma: no cover
-                    # Should not happen when prefix_flat is in valid_base_keys.
-                    continue
-                if isinstance(target_in_base, dict):
-                    heuristic_match = f"{prefix_flat}.{rest_flat}"
-                    break
+                dots = candidate.count(".")
+                first_dot = candidate.find(".")  # -1 if no dots
+                if (dots > best_dots) or (
+                    dots == best_dots and first_dot > best_first_dot
+                ) or (
+                    dots == best_dots
+                    and first_dot == best_first_dot
+                    and (heuristic_match is None or candidate < heuristic_match)
+                ):
+                    best_dots = dots
+                    best_first_dot = first_dot
+                    heuristic_match = candidate
 
             if heuristic_match is not None:
                 remapped_key = heuristic_match
@@ -1269,6 +1309,21 @@ class Config(dict[str, Any]):
                 # rule: empty-prefix → nested; otherwise tied to
                 # ``load_dotenv_file``. Explicit "nested" / "flat" bypass
                 # this entirely.
+                #
+                # rc6 patch: the .env-mode (non-empty prefix +
+                # load_dotenv_file=True) auto-resolution now uses a NEW
+                # ``dotenv_nested`` mode whose semantics are
+                # "first-underscore-as-section, rest preserved as leaf".
+                # This differs from plain ``nested`` (which would split
+                # at every underscore) and from ``flat`` (no nesting at
+                # all).  Rationale: in .env files, operators write
+                # ``MYAPP_SECRETS_API_KEY=...`` expecting the value to
+                # land at ``secrets.api_key`` (because the natural
+                # convention is "first separator is section, rest is
+                # leaf name"), not at ``secrets.api.key``.  See test
+                # ``test_unmatched_env_var_in_dotenv_mode_uses_first_underscore_as_section``.
+                # The explicit ``nested`` and ``flat`` modes retain
+                # their pre-rc6 behaviour exactly.
                 if env_remap_fallback == "nested":
                     effective_mode = "nested"
                 elif env_remap_fallback == "flat":
@@ -1277,7 +1332,7 @@ class Config(dict[str, Any]):
                     if prefix == "":
                         effective_mode = "nested"
                     elif load_dotenv_file:
-                        effective_mode = "nested"
+                        effective_mode = "dotenv_nested"
                     else:
                         effective_mode = "flat"
 
@@ -1287,6 +1342,21 @@ class Config(dict[str, Any]):
                     log.debug(
                         f"No remap target for '{dot_key}'. "
                         f"Falling back (nested) to '{final_key}'."
+                    )
+                elif effective_mode == "dotenv_nested":
+                    # rc6: first dot is section separator; collapse the
+                    # remaining dots back to underscores so the leaf
+                    # name keeps its multi-word form (e.g.
+                    # ``secrets.api.key`` -> ``secrets.api_key``).
+                    head, sep, tail = dot_key.partition(".")
+                    if sep:
+                        final_key = head + "." + tail.replace(".", "_")
+                    else:
+                        # No dots at all -> single flat key.
+                        final_key = dot_key
+                    log.debug(
+                        f"No remap target for '{dot_key}'. "
+                        f"Falling back (dotenv_nested) to '{final_key}'."
                     )
                 else:  # "flat"
                     # Collapse to a single underscore-joined flat key.
