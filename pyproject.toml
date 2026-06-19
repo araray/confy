@@ -27,6 +27,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+accurate-tokens = [
+    "tiktoken>=0.7.0",
+]
 dev = [
     "pytest>=8",
     "pytest-cov>=4",
