@@ -12,4 +12,24 @@ New in 0.4.0:
     - Utility functions in ``confy.utils``
 """
 
+from confy.capabilities import (
+    CapabilityDescription,
+    CapabilityExample,
+    RenderStyle,
+    RiskLevel,
+    mcp_tool_to_capability,
+    normalize_risk_level,
+    render_for_llm,
+)
+
 __version__ = "0.4.0"
+
+__all__ = [
+    "CapabilityDescription",
+    "CapabilityExample",
+    "RenderStyle",
+    "RiskLevel",
+    "mcp_tool_to_capability",
+    "normalize_risk_level",
+    "render_for_llm",
+]
