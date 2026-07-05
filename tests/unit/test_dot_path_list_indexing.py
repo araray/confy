@@ -22,6 +22,11 @@ particular:
 * ``set_by_dot`` NEVER grows or creates lists — assignment only targets an
   existing index; out-of-range raises ``KeyError`` regardless of
   ``create_missing``.
+* The highest-precedence sources (explicit ``overrides_dict`` entries and
+  env vars) still ALWAYS win: when ``set_by_dot`` refuses a list write,
+  the loader falls back to the historical clobber-with-dict behavior
+  instead of dropping the value
+  (:class:`TestOverridePrecedenceOnListRefusal`).
 """
 
 from __future__ import annotations
@@ -335,3 +340,80 @@ class TestContainsDot:
         from confy import contains_dot as root_contains_dot
 
         assert root_contains_dot({"k": 1}, "k") is True
+
+
+# =============================================================================
+# Precedence guarantee: overrides/env vars still win when set_by_dot refuses
+# =============================================================================
+
+
+class TestOverridePrecedenceOnListRefusal:
+    """Explicit ``overrides_dict`` entries and env vars are the
+    highest-precedence sources and must ALWAYS be applied, even when
+    ``set_by_dot`` refuses the write (out-of-range list index — lists
+    never grow). In that case the loader falls back to the historical
+    pre-SF-2 behavior: the blocking list is clobbered with nested dicts.
+    """
+
+    def test_out_of_range_override_clobbers_list(self, caplog) -> None:
+        """Baseline (pre-SF-2) parity: 'a.5' against a 2-element list
+        replaces the list with a dict instead of being dropped."""
+        with caplog.at_level(logging.WARNING, logger="confy.loader"):
+            cfg = Config(
+                defaults={},
+                overrides_dict={"a": "[1, 2]", "a.5": "x"},
+                load_dotenv_file=False,
+            )
+        assert cfg.as_dict() == {"a": {"5": "x"}}
+        # Applied via the fallback, reported at WARNING (not silently
+        # dropped at ERROR).
+        assert any(
+            "a.5" in rec.message and "overwrite" in rec.message
+            for rec in caplog.records
+            if rec.levelno == logging.WARNING
+        )
+        assert not any(rec.levelno >= logging.ERROR for rec in caplog.records)
+
+    def test_in_range_override_updates_list_in_place(self) -> None:
+        """SF-2 v1 feature at the precedence layer: an in-range index
+        writes into the list instead of clobbering it."""
+        cfg = Config(
+            defaults={},
+            overrides_dict={"a": "[1, 2]", "a.1": "x"},
+            load_dotenv_file=False,
+        )
+        assert cfg.as_dict() == {"a": [1, "x"]}
+
+    def test_out_of_range_override_against_defaults_list(self) -> None:
+        """The override wins over a list coming from the defaults layer."""
+        cfg = Config(
+            defaults={"servers": [{"host": "a"}, {"host": "b"}]},
+            overrides_dict={"servers.5.host": "typo"},
+            load_dotenv_file=False,
+        )
+        assert cfg.get("servers.5.host") == "typo"
+
+    def test_structure_overrides_fallback_direct(self) -> None:
+        structured = Config._structure_overrides({"a": [1, 2], "a.5": "x"})
+        assert structured == {"a": {"5": "x"}}
+
+    def test_out_of_range_env_var_still_applied(self, monkeypatch) -> None:
+        """Baseline parity: MYAPP_L_5 against a 2-element MYAPP_L list is
+        applied (clobber + flat remap fallback), not dropped."""
+        monkeypatch.setenv("MYAPP_L", "[1,2]")
+        monkeypatch.setenv("MYAPP_L_5", "9")
+        cfg = Config(prefix="MYAPP", load_dotenv_file=False)
+        assert cfg.as_dict() == {"l_5": 9}
+
+    def test_in_range_env_var_indexes_into_list(self, monkeypatch) -> None:
+        """SF-2 v1 feature at the env layer: an in-range index lands in
+        the list element."""
+        monkeypatch.setenv("MYAPP_L", "[1,2]")
+        monkeypatch.setenv("MYAPP_L_0", "99")
+        cfg = Config(prefix="MYAPP", load_dotenv_file=False)
+        assert cfg.as_dict() == {"l": [99, 2]}
+
+    def test_collect_env_vars_fallback_direct(self, monkeypatch) -> None:
+        monkeypatch.setenv("MYAPP_L", "[1,2]")
+        monkeypatch.setenv("MYAPP_L_5", "9")
+        assert Config._collect_env_vars("MYAPP") == {"l": {"5": 9}}

@@ -337,6 +337,51 @@ def set_by_dot(
         d[final_key] = value
 
 
+def _force_set_by_dot(
+    cfg: Union[dict[str, Any], "Config"],
+    key: str,
+    value: Any,
+) -> None:
+    """Dot-path set that always succeeds on a dict/Config root.
+
+    This is the historical (pre-SF-2) :func:`set_by_dot` traversal with
+    ``create_missing=True``: only dicts/Configs are traversable and ANY
+    other intermediate value — scalar, list, tuple, ... — is clobbered
+    with a fresh dict (a warning is logged).
+
+    It exists as the fallback for the highest-precedence sources
+    (explicit ``overrides_dict`` entries and environment variables):
+    since SF-2 v1, :func:`set_by_dot` refuses list writes it cannot
+    satisfy in place (e.g. a digit segment indexing a list out of range
+    — lists never grow). Those sources must still win over earlier
+    layers, so their callers fall back to this overwrite behavior
+    instead of dropping the value.
+    """
+    parts = key.split(".")
+    d = cfg
+    for p in parts[:-1]:
+        current_val = d.get(p)
+        if not isinstance(current_val, (dict, Config)):
+            if p in d:
+                log.warning(
+                    f"Warning: Overwriting non-dictionary key '{p}' (type: {type(current_val).__name__}) in path '{key}' during set_by_dot."
+                )
+            new_dict = Config({}) if isinstance(d, Config) else {}
+            d[p] = new_dict
+            current_val = new_dict
+        d = current_val
+
+    final_key = parts[-1]
+    if (
+        isinstance(d, Config)
+        and isinstance(value, dict)
+        and not isinstance(value, Config)
+    ):
+        d[final_key] = Config(value)
+    else:
+        d[final_key] = value
+
+
 def get_by_dot(cfg: Union[Mapping[str, Any], "Config"], key: str) -> Any:
     """
     Retrieve a nested value from a Mapping (like dict or Config) using a dot-notated key.
@@ -1245,14 +1290,28 @@ class Config(dict[str, Any]):
                 try:
                     set_by_dot(env_data, dot_key, val, create_missing=True)
                     applied_count += 1
+                except (KeyError, TypeError) as e:
+                    # Since SF-2 v1, ``set_by_dot`` refuses list writes it
+                    # cannot satisfy in place (e.g. an earlier env var
+                    # produced a list value and a later digit segment
+                    # indexes it out of range — lists never grow). Env
+                    # vars must still win over earlier sources, so fall
+                    # back to the historical pre-SF-2 behavior of
+                    # clobbering the blocking value with nested dicts
+                    # instead of dropping the variable.
+                    log.warning(
+                        f"Env var '{var}' (key: '{dot_key}') cannot be applied in place ({e}); "
+                        f"falling back to overwrite semantics."
+                    )
+                    _force_set_by_dot(env_data, dot_key, val)
+                    applied_count += 1
                 except Exception as e:  # pragma: no cover
-                    # I-13: near-defensive. With ``create_missing=True``
-                    # intermediate dicts are spawned on the fly, so
-                    # ``set_by_dot`` cannot raise on a missing dict path.
-                    # Since SF-2 v1 it CAN raise ``KeyError`` if an
-                    # earlier env var produced a list value and a later
-                    # digit segment indexes it out of range (lists never
-                    # grow); such a var is logged and skipped.
+                    # I-13: defensive. With ``create_missing=True``
+                    # intermediate dicts are spawned on the fly and the
+                    # documented ``set_by_dot`` failure modes (KeyError/
+                    # TypeError) are handled above, so this is believed
+                    # unreachable; kept so a single pathological env var
+                    # can never crash the whole load.
                     log.error(
                         f"Error processing environment variable '{var}' (key: '{dot_key}') into structure: {e}"
                     )
@@ -1581,23 +1640,34 @@ class Config(dict[str, Any]):
 
         for key in sorted_keys:
             raw_val = overrides_dict[key]
+            # Parse the value from the overrides dict before setting
+            # Note: _parse_value is already called in _collect_env_vars,
+            # but calling it again here handles the case for the explicit overrides_dict.
+            # It's idempotent for non-string types.
+            parsed_val = _parse_value(raw_val)
             try:
-                # Parse the value from the overrides dict before setting
-                # Note: _parse_value is already called in _collect_env_vars,
-                # but calling it again here handles the case for the explicit overrides_dict.
-                # It's idempotent for non-string types.
-                parsed_val = _parse_value(raw_val)
                 # Use create_missing=True for overrides
                 set_by_dot(structured_overrides, key, parsed_val, create_missing=True)
+            except (KeyError, TypeError) as e:
+                # Since SF-2 v1, ``set_by_dot`` refuses list writes it
+                # cannot satisfy in place (e.g. an override key indexes a
+                # previously-set list value out of range — lists never
+                # grow). Explicit overrides have the highest precedence
+                # and must always win, so fall back to the historical
+                # pre-SF-2 behavior of clobbering the blocking value with
+                # nested dicts instead of dropping the override.
+                log.warning(
+                    f"Override key '{key}' cannot be applied in place ({e}); "
+                    f"falling back to overwrite semantics."
+                )
+                _force_set_by_dot(structured_overrides, key, parsed_val)
             except Exception as e:  # pragma: no cover
-                # I-12: near-defensive. ``_parse_value`` is exhaustively
-                # try/except'd internally and ``set_by_dot`` with
-                # ``create_missing=True`` is path-safe for dict paths.
-                # Since SF-2 v1, ``set_by_dot`` can raise ``KeyError``
-                # when an override key indexes a previously-set list
-                # value out of range (lists never grow); such an
-                # override is logged and skipped rather than crashing
-                # the whole load.
+                # I-12: defensive. ``_parse_value`` is exhaustively
+                # try/except'd internally and the documented
+                # ``set_by_dot`` failure modes (KeyError/TypeError) are
+                # handled above, so this is believed unreachable; kept so
+                # a single pathological override can never crash the
+                # whole load.
                 log.error(f"Error processing override key '{key}': {e}")
 
         # Return deepcopy to prevent modification of input dict (though structure is new)
