@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/logo_dark_confy.png">
+    <img src="assets/branding/logo_light_confy.png" alt="confy" width="720">
+  </picture>
+</p>
+
 # confy
 
 **confy** is a minimal, flexible Python configuration library (requiring **Python 3.10+**) and accompanying CLI tool. It simplifies configuration management by providing a unified way to:
