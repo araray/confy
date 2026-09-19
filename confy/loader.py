@@ -26,7 +26,7 @@ import copy  # For deepcopy
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableSequence, Sequence
 from pathlib import Path
 from typing import Any, Union
 
@@ -147,6 +147,43 @@ def _record_provenance_leaves(
             store.record(full_key, value, source)
 
 
+def _as_sequence_index(segment: str) -> int | None:
+    """Return ``segment`` as a non-negative int index if it is all ASCII digits.
+
+    Returns ``None`` for anything else (negative numbers, non-ASCII digits,
+    empty strings, ...), meaning "this segment is not a list index".
+    Helper for the additive list-index traversal in :func:`get_by_dot` /
+    :func:`set_by_dot` (SF-2 v1).
+    """
+    if segment.isascii() and segment.isdigit():
+        return int(segment)
+    return None
+
+
+def _is_indexable_sequence(node: Any) -> bool:
+    """True if ``node`` is a sequence that dot-path *read* traversal may index.
+
+    Strings/bytes are sequences but are never treated as traversable
+    containers; mappings (including :class:`Config`) always use key lookup
+    instead, so a dict with a string key ``"0"`` behaves exactly as before.
+    """
+    return isinstance(node, Sequence) and not isinstance(
+        node, (str, bytes, bytearray, Mapping)
+    )
+
+
+def _is_mutable_sequence(node: Any) -> bool:
+    """True if ``node`` is a sequence that dot-path *write* traversal may index.
+
+    Writes are restricted to mutable sequences (e.g. ``list``); immutable
+    sequences such as tuples keep the pre-existing :func:`set_by_dot`
+    behavior (overwrite-with-dict or raise, depending on ``create_missing``).
+    """
+    return isinstance(node, MutableSequence) and not isinstance(
+        node, (str, bytes, bytearray, Mapping)
+    )
+
+
 def set_by_dot(
     cfg: Union[dict[str, Any], "Config"],
     key: str,
@@ -162,22 +199,79 @@ def set_by_dot(
     dictionary, it will be overwritten with a new dictionary (a warning will
     be logged) only if create_missing is True.
 
+    List-index traversal (additive, SF-2 v1):
+        When the current node is a mutable sequence (e.g. ``list`` — not
+        ``str``/``bytes``/dict) and the corresponding path segment is all
+        ASCII digits, the segment is used as a list index. Dict lookup always
+        wins on dicts: a dict with the string key ``"0"`` behaves exactly as
+        before. Assignment only targets an EXISTING list index — lists are
+        NEVER grown or created, even when ``create_missing`` is True; an
+        out-of-range index raises ``KeyError``. Immutable sequences (tuples)
+        are not written through and keep the pre-existing behavior.
+
     Args:
         cfg: The dictionary or Config object to modify.
         key: The dot-notation string representing the path (e.g., "database.host").
         value: The value to set at the specified path.
         create_missing: If True, create intermediate dicts. If False, raise
-                        KeyError or TypeError if the path is invalid.
+                        KeyError or TypeError if the path is invalid. Note
+                        that list elements are never created either way.
 
     Raises:
-        KeyError: If a key part is not found and create_missing is False.
-        TypeError: If a path segment is not a dict and create_missing is False.
+        KeyError: If a key part is not found and create_missing is False, or
+                  if a list-index segment is out of range (lists never grow).
+        TypeError: If a path segment is not a dict and create_missing is
+                   False, or if a non-numeric segment is applied to a list.
     """
     parts = key.split(".")
     d = cfg  # Start traversal from the root dictionary/Config
     # Traverse the path up to the second-to-last part
     for i, p in enumerate(parts[:-1]):
+        # --- Additive (SF-2 v1): the current container is a list ---
+        # Reached only via list-index traversal (or a sequence root), so
+        # existing dict-rooted access patterns never enter this branch.
+        if _is_mutable_sequence(d):
+            idx = _as_sequence_index(p)
+            if idx is None:
+                raise TypeError(
+                    f"Path segment '{p}' in key '{key}' is not a valid list index "
+                    f"(container is a {type(d).__name__})."
+                )
+            if idx >= len(d):
+                raise KeyError(
+                    f"List index '{p}' out of range in key '{key}' "
+                    f"(set_by_dot never grows lists)"
+                )
+            current_val = d[idx]
+            if isinstance(current_val, (dict, Config)) or (
+                _is_mutable_sequence(current_val)
+                and _as_sequence_index(parts[i + 1]) is not None
+            ):
+                d = current_val
+                continue
+            if not create_missing:
+                raise TypeError(
+                    f"Path segment '{p}' (type: {type(current_val).__name__}) in key '{key}' is not a dictionary."
+                )
+            # create_missing=True: replace the EXISTING element with a fresh
+            # dict (mirrors the dict-container overwrite behavior below).
+            log.warning(
+                f"Warning: Overwriting non-dictionary list element at index {idx} in path '{key}' during set_by_dot."
+            )
+            new_dict = Config({}) if isinstance(cfg, Config) else {}
+            d[idx] = new_dict
+            d = new_dict
+            continue
+
         current_val = d.get(p)  # Use .get() for safe access on both dict/Config
+
+        # Additive (SF-2 v1): a list value is traversable (instead of being
+        # overwritten/raised on) when the NEXT segment is all ASCII digits.
+        if _is_mutable_sequence(current_val) and (
+            _as_sequence_index(parts[i + 1]) is not None
+        ):
+            d = current_val
+            continue
 
         if not isinstance(current_val, (dict, Config)):  # Check if it's dict-like
             if not create_missing:
@@ -202,6 +296,32 @@ def set_by_dot(
 
     # Set the value at the final key part
     final_key = parts[-1]
+
+    # --- Additive (SF-2 v1): the final container is a list ---
+    if _is_mutable_sequence(d):
+        idx = _as_sequence_index(final_key)
+        if idx is None:
+            raise TypeError(
+                f"Final segment '{final_key}' in key '{key}' is not a valid list "
+                f"index (container is a {type(d).__name__})."
+            )
+        if idx >= len(d):
+            raise KeyError(
+                f"List index '{final_key}' out of range in key '{key}' "
+                f"(set_by_dot never grows lists)"
+            )
+        # Wrap dict values in Config when operating inside a Config tree so
+        # chained dot-notation access keeps working (mirrors dict path below).
+        if (
+            isinstance(cfg, Config)
+            and isinstance(value, dict)
+            and not isinstance(value, Config)
+        ):
+            d[idx] = Config(value)
+        else:
+            d[idx] = value
+        return
+
     if not create_missing and final_key not in d:
         # If the final key itself is missing and we are not creating.
         raise KeyError(f"Final key '{final_key}' not found in path '{key}'")
@@ -217,9 +337,63 @@ def set_by_dot(
         d[final_key] = value
 
 
+def _force_set_by_dot(
+    cfg: Union[dict[str, Any], "Config"],
+    key: str,
+    value: Any,
+) -> None:
+    """Dot-path set that always succeeds on a dict/Config root.
+
+    This is the historical (pre-SF-2) :func:`set_by_dot` traversal with
+    ``create_missing=True``: only dicts/Configs are traversable and ANY
+    other intermediate value — scalar, list, tuple, ... — is clobbered
+    with a fresh dict (a warning is logged).
+
+    It exists as the fallback for the highest-precedence sources
+    (explicit ``overrides_dict`` entries and environment variables):
+    since SF-2 v1, :func:`set_by_dot` refuses list writes it cannot
+    satisfy in place (e.g. a digit segment indexing a list out of range
+    — lists never grow). Those sources must still win over earlier
+    layers, so their callers fall back to this overwrite behavior
+    instead of dropping the value.
+    """
+    parts = key.split(".")
+    d = cfg
+    for p in parts[:-1]:
+        current_val = d.get(p)
+        if not isinstance(current_val, (dict, Config)):
+            if p in d:
+                log.warning(
+                    f"Warning: Overwriting non-dictionary key '{p}' (type: {type(current_val).__name__}) in path '{key}' during set_by_dot."
+                )
+            new_dict = Config({}) if isinstance(d, Config) else {}
+            d[p] = new_dict
+            current_val = new_dict
+        d = current_val
+
+    final_key = parts[-1]
+    if (
+        isinstance(d, Config)
+        and isinstance(value, dict)
+        and not isinstance(value, Config)
+    ):
+        d[final_key] = Config(value)
+    else:
+        d[final_key] = value
+
+
 def get_by_dot(cfg: Union[Mapping[str, Any], "Config"], key: str) -> Any:
     """
     Retrieve a nested value from a Mapping (like dict or Config) using a dot-notated key.
+
+    List-index traversal (additive, SF-2 v1):
+        When the current node is a sequence (e.g. ``list``/``tuple`` — not
+        ``str``/``bytes``/dict) and the corresponding path segment is all
+        ASCII digits, the segment is used as a sequence index (e.g.
+        ``"servers.0.host"``). Dict lookup always wins on dicts: a dict with
+        the string key ``"0"`` behaves exactly as before. An out-of-range or
+        unusable index behaves like a missing key (``KeyError``); a non-digit
+        segment on a sequence still raises ``TypeError`` as before.
 
     Args:
         cfg: The dictionary or Config object to retrieve from.
@@ -229,7 +403,8 @@ def get_by_dot(cfg: Union[Mapping[str, Any], "Config"], key: str) -> Any:
         The value found at the specified path.
 
     Raises:
-        KeyError: If any part of the key path does not exist.
+        KeyError: If any part of the key path does not exist (including an
+                  out-of-range list index).
         TypeError: If an attempt is made to access a key on a non-dictionary item
                    during path traversal (e.g., accessing "a.b" when "a" is an integer).
     """
@@ -241,6 +416,19 @@ def get_by_dot(cfg: Union[Mapping[str, Any], "Config"], key: str) -> Any:
     try:
         for i, p in enumerate(parts):
             current_path_parts.append(p)
+            # Additive (SF-2 v1): list-index traversal. Sequences are never
+            # Mappings, so dict access patterns are unaffected.
+            if _is_indexable_sequence(d):
+                idx = _as_sequence_index(p)
+                if idx is not None:
+                    if idx >= len(d):
+                        # Same semantics as a missing dict key; formatted by
+                        # the `except KeyError` handler below.
+                        raise KeyError(p)
+                    d = d[idx]
+                    continue
+                # Non-digit segment on a sequence: fall through to the
+                # pre-existing TypeError below (unchanged behavior).
             # Ensure the current level 'd' is a dictionary-like object before indexing
             # Check Mapping for dicts, Config for Config objects
             if not isinstance(d, (Mapping, Config)):
@@ -275,6 +463,29 @@ def get_by_dot(cfg: Union[Mapping[str, Any], "Config"], key: str) -> Any:
     except TypeError as e:
         # Catch other TypeErrors that might occur during access
         raise TypeError(f"Invalid access path '{key}': {e}") from e
+
+
+def contains_dot(cfg: Union[Mapping[str, Any], "Config"], key: str) -> bool:
+    """
+    Return True if ``key`` resolves to a value in ``cfg``, without raising.
+
+    Mirrors :func:`get_by_dot` traversal exactly (including the additive
+    list-index segments, SF-2 v1): any ``KeyError`` or ``TypeError`` raised
+    during traversal is reported as ``False`` instead of propagating. A key
+    whose value is ``None`` is still reported as present.
+
+    Args:
+        cfg: The dictionary or Config object to check.
+        key: The dot-notation string representing the path (e.g., "database.host").
+
+    Returns:
+        True if the full path resolves, False otherwise.
+    """
+    try:
+        get_by_dot(cfg, key)
+    except (KeyError, TypeError):
+        return False
+    return True
 
 
 def _parse_value(raw_value: Any) -> Any:
@@ -1079,14 +1290,28 @@ class Config(dict[str, Any]):
                 try:
                     set_by_dot(env_data, dot_key, val, create_missing=True)
                     applied_count += 1
+                except (KeyError, TypeError) as e:
+                    # Since SF-2 v1, ``set_by_dot`` refuses list writes it
+                    # cannot satisfy in place (e.g. an earlier env var
+                    # produced a list value and a later digit segment
+                    # indexes it out of range — lists never grow). Env
+                    # vars must still win over earlier sources, so fall
+                    # back to the historical pre-SF-2 behavior of
+                    # clobbering the blocking value with nested dicts
+                    # instead of dropping the variable.
+                    log.warning(
+                        f"Env var '{var}' (key: '{dot_key}') cannot be applied in place ({e}); "
+                        f"falling back to overwrite semantics."
+                    )
+                    _force_set_by_dot(env_data, dot_key, val)
+                    applied_count += 1
                 except Exception as e:  # pragma: no cover
-                    # I-13: defensive only. With ``create_missing=True``
-                    # the path is unconditionally created (intermediate
-                    # dicts are spawned on the fly), so ``set_by_dot``
-                    # cannot raise on a missing path. The only realistic
-                    # raise path would be a non-string key in ``dot_key``,
-                    # which is unreachable because ``dot_key`` is built
-                    # from the (string) env-var name.
+                    # I-13: defensive. With ``create_missing=True``
+                    # intermediate dicts are spawned on the fly and the
+                    # documented ``set_by_dot`` failure modes (KeyError/
+                    # TypeError) are handled above, so this is believed
+                    # unreachable; kept so a single pathological env var
+                    # can never crash the whole load.
                     log.error(
                         f"Error processing environment variable '{var}' (key: '{dot_key}') into structure: {e}"
                     )
@@ -1415,23 +1640,34 @@ class Config(dict[str, Any]):
 
         for key in sorted_keys:
             raw_val = overrides_dict[key]
+            # Parse the value from the overrides dict before setting
+            # Note: _parse_value is already called in _collect_env_vars,
+            # but calling it again here handles the case for the explicit overrides_dict.
+            # It's idempotent for non-string types.
+            parsed_val = _parse_value(raw_val)
             try:
-                # Parse the value from the overrides dict before setting
-                # Note: _parse_value is already called in _collect_env_vars,
-                # but calling it again here handles the case for the explicit overrides_dict.
-                # It's idempotent for non-string types.
-                parsed_val = _parse_value(raw_val)
                 # Use create_missing=True for overrides
                 set_by_dot(structured_overrides, key, parsed_val, create_missing=True)
+            except (KeyError, TypeError) as e:
+                # Since SF-2 v1, ``set_by_dot`` refuses list writes it
+                # cannot satisfy in place (e.g. an override key indexes a
+                # previously-set list value out of range — lists never
+                # grow). Explicit overrides have the highest precedence
+                # and must always win, so fall back to the historical
+                # pre-SF-2 behavior of clobbering the blocking value with
+                # nested dicts instead of dropping the override.
+                log.warning(
+                    f"Override key '{key}' cannot be applied in place ({e}); "
+                    f"falling back to overwrite semantics."
+                )
+                _force_set_by_dot(structured_overrides, key, parsed_val)
             except Exception as e:  # pragma: no cover
-                # I-12: defensive only. ``_parse_value`` is exhaustively
-                # try/except'd internally and ``set_by_dot`` with
-                # ``create_missing=True`` is path-safe, so no realistic
-                # input reaches this handler. Kept for forward
-                # compatibility (a future refactor that lets
-                # ``set_by_dot`` raise on a structural conflict should
-                # surface here as an error log rather than crashing the
-                # whole load).
+                # I-12: defensive. ``_parse_value`` is exhaustively
+                # try/except'd internally and the documented
+                # ``set_by_dot`` failure modes (KeyError/TypeError) are
+                # handled above, so this is believed unreachable; kept so
+                # a single pathological override can never crash the
+                # whole load.
                 log.error(f"Error processing override key '{key}': {e}")
 
         # Return deepcopy to prevent modification of input dict (though structure is new)

@@ -10,6 +10,24 @@ New in 0.4.0:
     - Per-app env var routing via ``app_prefixes``
     - Optional provenance tracking via ``track_provenance``
     - Utility functions in ``confy.utils``
+
+New (SF-2 v1):
+    - Additive dot-path list indexing in ``get_by_dot``/``set_by_dot``
+    - ``contains_dot(config, key)`` non-raising existence check
 """
 
-__version__ = "0.4.0"
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+from .loader import contains_dot
+
+try:
+    # Single source of truth: the version recorded in package metadata
+    # (i.e. [project].version in pyproject.toml at install/build time).
+    __version__ = _pkg_version("confy")
+except _PackageNotFoundError:  # pragma: no cover - running from a source tree
+    # Fallback for environments where confy is importable but not installed
+    # (e.g. sys.path manipulation). Keep in sync with pyproject.toml.
+    __version__ = "0.4.2"
+
+__all__ = ["contains_dot", "__version__"]
